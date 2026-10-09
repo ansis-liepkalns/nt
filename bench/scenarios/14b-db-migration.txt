@@ -1,0 +1,10 @@
+# gold: name: acme-db-migration | topic: acme backend: running postgres schema migration
+cwd: ~/work/acme (git acme, branch feature/dashboard)
+commands (oldest first):
+  [~/work/acme] cd db                                     ok      0s
+  [~/work/acme/db] psql -c '\dt' acme_dev                 ok      0s
+  [~/work/acme/db] alembic upgrade head                   exit 1  2s
+      | sqlalchemy.exc.ProgrammingError: column "tenant_id" already exists
+  [~/work/acme/db] vim migrations/versions/0042_tenant.py ok      5m
+  [~/work/acme/db] alembic upgrade head                   running 1m
+foreground: alembic upgrade head

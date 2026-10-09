@@ -1,0 +1,8 @@
+# gold: name: webshop-config | topic: webshop api: editing config after build
+cwd: ~/work/webshop/api (git webshop, branch main)
+commands (oldest first):
+  [~/work/webshop/api] git pull                    ok      3s
+  [~/work/webshop/api] make                        ok      1m20s
+  [~/work/webshop/api] ls config/                  ok      0s
+  [~/work/webshop/api] vim config/production.yaml  running 4m
+foreground: vim config/production.yaml

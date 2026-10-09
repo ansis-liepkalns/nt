@@ -1,0 +1,8 @@
+# gold: name: zstd-release-build | topic: building the zstd library, release build
+cwd: ~/src/zstd (git zstd, branch release-1.5)
+commands (oldest first):
+  [~/src/zstd] git checkout release-1.5   ok      1s
+  [~/src/zstd] make clean                 ok      0s
+  [~/src/zstd] make -j16                  ok      6m41s
+      | make[1]: Leaving directory '/home/user/src/zstd/lib'
+foreground: bash

@@ -1,0 +1,45 @@
+# ~/.config/nt/config.toml  (all keys optional; a minimal key = "string" / number / bool reader, not full TOML)
+
+# Prefix key: C-<letter> or one of C-@ C-[ C-\ C-] C-^ C-_
+prefix = "C-]"
+# Lines of scrollback kept per session by the server.
+scrollback = 1000
+# TCP port for remote clients.
+port = 4022
+# Inject prompt/command hooks into bash, zsh and fish sessions (live status, command log).
+shell_integration = true
+
+# One-time 3-second key tip on the bottom row when a client attaches.
+tips = true
+
+# ---- Names, topics and summaries --------------------------------------------------------------
+# "local": a small GGUF model run by a short-lived `nt namer` process (needs a build with the `llm`
+#          feature, the default; the default for such builds)
+# "api"  : an OpenAI-compatible chat completions endpoint, through curl (see below)
+# "off"  : heuristic names only
+llm = "local"
+
+# Local model: an https URL (downloaded once to ~/.local/share/nt/models/) or a path to a .gguf file.
+# Any architecture llama.cpp supports works; the model's own chat template is used.
+llm_model = "https://huggingface.co/ibm-granite/granite-4.0-1b-GGUF/resolve/main/granite-4.0-1b-Q4_K_M.gguf"
+# Lighter alternative, about half the RAM (~0.9 GB peak instead of ~1.8 GB), slightly lower quality:
+# llm_model = "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf"
+
+# Threads for the local model. "auto": prompt processing nproc/2 (at most 16), generation nproc/4 (at most 8),
+# measured on a 48-core machine; the model still runs at idle CPU priority. A number N uses N threads for the
+# prompt and min(N, 8) for generation.
+llm_threads = "auto"
+
+# Run the local model while on battery power? false = naming waits until AC is plugged in.
+# (Runs are also skipped when free memory is low or the machine is under memory pressure; see README.)
+llm_on_battery = false
+
+# API backend (llm = "api"). Command digests (cwd, recent commands, a few output lines) are sent to this
+# server after masking obvious secrets; see README.md. Works in builds without the `llm` feature.
+# llm = "api"
+llm_api_url = "https://api.openai.com/v1/chat/completions"
+llm_api_model = "gpt-5-nano"
+# The key is read from this environment variable of the nt server process ...
+llm_api_key_env = "OPENAI_API_KEY"
+# ... or, if that is unset, from this file (first line; keep it mode 0600).
+# llm_api_key_file = "~/.config/nt/openai.key"

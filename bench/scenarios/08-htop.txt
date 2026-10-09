@@ -1,0 +1,5 @@
+# gold: name: htop-monitor | topic: monitoring cpu and memory on the box
+cwd: ~
+commands (oldest first):
+  [~] htop                         running 47m
+foreground: htop

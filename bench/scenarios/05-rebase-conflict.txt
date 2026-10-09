@@ -1,0 +1,10 @@
+# gold: name: dotfiles-rebase | topic: dotfiles: rebasing zsh branch onto main, resolving conflict
+cwd: ~/dotfiles (git dotfiles, branch zsh-rework|REBASE 2/5)
+commands (oldest first):
+  [~/dotfiles] git fetch origin                  ok      2s
+  [~/dotfiles] git rebase origin/main            exit 1  1s
+      | CONFLICT (content): Merge conflict in zsh/aliases.zsh
+      | error: could not apply 3f2a1c9... move aliases to separate file
+  [~/dotfiles] git diff --name-only --diff-filter=U ok      0s
+  [~/dotfiles] vim zsh/aliases.zsh               ok      3m
+foreground: bash

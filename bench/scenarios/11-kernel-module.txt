@@ -1,0 +1,10 @@
+# gold: name: nvme-module-build | topic: out-of-tree nvme kernel module: build and load
+cwd: ~/kmod/nvme-stats (git nvme-stats, branch main)
+commands (oldest first):
+  [~/kmod/nvme-stats] make -C /lib/modules/6.8.0/build M=$PWD modules ok 41s
+      | LD [M]  /home/user/kmod/nvme-stats/nvme_stats.ko
+  [~/kmod/nvme-stats] sudo insmod nvme_stats.ko           exit 1  0s
+      | insmod: ERROR: could not insert module nvme_stats.ko: Invalid module format
+  [~/kmod/nvme-stats] dmesg | tail                        ok      0s
+      | nvme_stats: version magic '6.8.0-51-generic' should be '6.8.0-52-generic'
+foreground: bash

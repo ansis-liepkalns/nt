@@ -1,0 +1,7 @@
+# nt shell integration for zsh (written by nt; do not edit).
+__nt_wrap=$ZDOTDIR
+ZDOTDIR=$NT_ORIG_ZDOTDIR
+if [[ -r $ZDOTDIR/.zprofile ]]; then source "$ZDOTDIR/.zprofile"; fi
+NT_ORIG_ZDOTDIR=$ZDOTDIR
+ZDOTDIR=$__nt_wrap
+unset __nt_wrap

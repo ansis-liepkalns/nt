@@ -1,0 +1,7 @@
+# gold: name: nt-agent-reconnect-fix | topic: fixing reconnect bug in nt proto.rs
+cwd: ~/src/nt (git nt, branch reconnect-fix)
+commands (oldest first):
+  [~/src/nt] git pull                 ok      2s
+  [~/src/nt] cargo build              ok      41s
+  [~/src/nt] agent                    running 18m  title: "Fix reconnect bug in proto.rs" (earlier: "Explore client code", "Run cargo test")  (interactive TUI, output omitted)
+foreground: agent

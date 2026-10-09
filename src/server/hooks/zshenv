@@ -1,0 +1,7 @@
+# nt shell integration for zsh (written by nt; do not edit). Runs the user's .zshenv with their ZDOTDIR.
+__nt_wrap=$ZDOTDIR
+ZDOTDIR=${NT_ORIG_ZDOTDIR:-$HOME}
+if [[ -r $ZDOTDIR/.zshenv ]]; then source "$ZDOTDIR/.zshenv"; fi
+export NT_ORIG_ZDOTDIR=$ZDOTDIR
+ZDOTDIR=$__nt_wrap
+unset __nt_wrap

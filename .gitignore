@@ -1,0 +1,16 @@
+# Rust build output (Cargo.lock is committed: nt is a binary)
+/target
+
+# Benchmark outputs and downloaded models
+/bench/results/
+*.gguf
+__pycache__/
+*.pyc
+
+# Local secrets and editor/OS clutter
+.env
+*.swp
+*~
+.idea/
+.vscode/
+.DS_Store

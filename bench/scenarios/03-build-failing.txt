@@ -1,0 +1,12 @@
+# gold: name: tokio-server-fix | topic: tokio chat server: fixing borrow checker errors
+cwd: ~/code/chatd (git chatd, branch async-rewrite)
+commands (oldest first):
+  [~/code/chatd] cargo check              exit 101 9s
+      | error[E0502]: cannot borrow `self.clients` as mutable because it is also borrowed as immutable
+      | error[E0599]: no method named `broadcast` found for struct `Hub`
+      | error: could not compile `chatd` (bin "chatd") due to 2 previous errors
+  [~/code/chatd] vim src/hub.rs           ok      6m
+  [~/code/chatd] cargo check              exit 101 7s
+      | error[E0502]: cannot borrow `self.clients` as mutable because it is also borrowed as immutable
+      | error: could not compile `chatd` (bin "chatd") due to 1 previous error
+foreground: bash

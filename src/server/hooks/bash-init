@@ -1,0 +1,112 @@
+# nt shell integration for bash (written by nt; do not edit, it is overwritten).
+# `bash -l` would ignore --rcfile, so this file does exactly what a login shell does itself:
+# /etc/profile, then the first of ~/.bash_profile, ~/.bash_login, ~/.profile.
+if [ -r /etc/profile ]; then . /etc/profile; fi
+for __nt_f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+  if [ -r "$__nt_f" ]; then . "$__nt_f"; break; fi
+done
+unset __nt_f
+
+# ---- hooks (after the user's files; existing PROMPT_COMMAND and DEBUG trap are kept) ----
+case $- in *i*) ;; *) return 0 2>/dev/null ;; esac
+if [ -n "${__nt_installed-}" ]; then return 0 2>/dev/null; fi
+__nt_installed=1
+__nt_armed=
+__nt_running=
+__nt_hnum=
+
+# Escape $1 into __nt_out for OSC 133;E: bytes outside printable ASCII, ';' and '\' become \xNN.
+__nt_enc() {
+  local LC_ALL=C s=${1:0:1000} o= c i
+  if [[ $s == *[!A-Za-z0-9\ _./=:@%+,-]* ]]; then
+    for ((i = 0; i < ${#s}; i++)); do
+      c=${s:i:1}
+      case $c in
+        [!\ -~] | ';' | '\') printf -v c '\\x%02x' "'$c" ;;
+      esac
+      o+=$c
+    done
+    s=$o
+  fi
+  __nt_out=$s
+}
+
+# OSC 7: current directory as a file:// URL.
+__nt_osc7() {
+  local LC_ALL=C s=$PWD o= c i
+  if [[ $s == *[!A-Za-z0-9/._~-]* ]]; then
+    for ((i = 0; i < ${#s}; i++)); do
+      c=${s:i:1}
+      case $c in
+        [A-Za-z0-9/._~-]) ;;
+        *) printf -v c '%%%02X' "'$c" ;;
+      esac
+      o+=$c
+    done
+    s=$o
+  fi
+  printf '\e]7;file://%s%s\a' "${HOSTNAME-}" "$s"
+}
+
+# First in PROMPT_COMMAND; keeps $? intact for the user's own commands.
+__nt_precmd() {
+  local ec=$?
+  if [[ -n $__nt_running ]]; then
+    printf '\e]133;D;%s\a' "$ec"
+    __nt_running=
+  fi
+  __nt_armed=
+  __nt_osc7
+  printf '\e]133;A\a'
+  return $ec
+}
+
+# Last in PROMPT_COMMAND: from here on the next DEBUG trap is a user command.
+__nt_arm() {
+  local ec=$?
+  __nt_armed=1
+  return $ec
+}
+
+__nt_debug() {
+  [[ -n $__nt_armed ]] || return 0
+  case $BASH_COMMAND in __nt_precmd* | __nt_arm*) return 0 ;; esac
+  __nt_armed=
+  local h n cmd=$BASH_COMMAND
+  h=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)
+  h=${h#"${h%%[![:space:]]*}"}
+  n=${h%%[[:space:]]*}
+  if [[ $n =~ ^[0-9]+$ && $n != "$__nt_hnum" ]]; then
+    __nt_hnum=$n
+    h=${h#"$n"}
+    h=${h#"${h%%[![:space:]]*}"}
+    [[ -n $h ]] && cmd=$h
+  fi
+  __nt_enc "$cmd"
+  __nt_running=1
+  printf '\e]133;E;%s\a\e]133;C\a' "$__nt_out"
+  # Something replaced PROMPT_COMMAND: put the hooks back for the next prompt.
+  [[ ${PROMPT_COMMAND[*]-} == *__nt_precmd* ]] || __nt_install_pc
+  return 0
+}
+
+__nt_install_pc() {
+  if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
+    PROMPT_COMMAND=(__nt_precmd "${PROMPT_COMMAND[@]}" __nt_arm)
+  else
+    PROMPT_COMMAND="__nt_precmd"$'\n'"${PROMPT_COMMAND-}"$'\n'"__nt_arm"
+  fi
+}
+
+__nt_install_trap() {
+  local t prev=
+  t=$(trap -p DEBUG)
+  if [[ -n $t ]]; then
+    eval "set -- $t"
+    prev=$3
+  fi
+  trap -- '__nt_debug "$_"'$'\n'"$prev" DEBUG
+}
+
+__nt_install_pc
+__nt_install_trap

@@ -1,0 +1,9 @@
+# gold: name: sales-analysis | topic: sales data analysis in ipython: quarterly revenue
+cwd: ~/analysis/sales2026 (venv .venv)
+commands (oldest first):
+  [~/analysis/sales2026] python -m venv .venv           ok      4s
+  [~/analysis/sales2026] source .venv/bin/activate      ok      0s
+  [~/analysis/sales2026] pip install pandas matplotlib ipython ok      31s
+  [~/analysis/sales2026] head -3 data/q3_revenue.csv    ok      0s
+  [~/analysis/sales2026] ipython                        running 25m
+foreground: ipython

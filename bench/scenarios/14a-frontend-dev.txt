@@ -1,0 +1,9 @@
+# gold: name: acme-frontend-dev | topic: acme web app: frontend dev server running
+cwd: ~/work/acme (git acme, branch feature/dashboard)
+commands (oldest first):
+  [~/work/acme] git checkout feature/dashboard  ok      0s
+  [~/work/acme] cd web                          ok      0s
+  [~/work/acme/web] npm install                 ok      38s
+  [~/work/acme/web] npm run dev                 running 21m
+      | [vite] hmr update /src/components/Chart.tsx
+foreground: npm run dev

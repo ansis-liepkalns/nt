@@ -1,0 +1,6 @@
+# gold: name: home-shell | topic: just started, browsing the projects folder
+cwd: ~/projects
+commands (oldest first):
+  [~] cd projects  ok  0s
+  [~/projects] ls  ok  0s
+foreground: bash

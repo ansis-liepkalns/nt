@@ -1,0 +1,67 @@
+# nt shell integration for zsh (written by nt; do not edit).
+__nt_wrap=$ZDOTDIR
+ZDOTDIR=$NT_ORIG_ZDOTDIR
+if [[ -r $ZDOTDIR/.zshrc ]]; then source "$ZDOTDIR/.zshrc"; fi
+NT_ORIG_ZDOTDIR=$ZDOTDIR
+unset __nt_wrap
+# From here on zsh finds .zlogin in the user's own ZDOTDIR, and children see it too.
+ZDOTDIR=$NT_ORIG_ZDOTDIR
+unset NT_ORIG_ZDOTDIR
+
+if [[ -z ${__nt_installed-} ]]; then
+  typeset -g __nt_installed=1 __nt_running=
+
+  # Escape $1 into REPLY for OSC 133;E: bytes outside printable ASCII, ';' and '\' become \xNN.
+  __nt_enc() {
+    emulate -L zsh
+    setopt nomultibyte
+    local s=${1[1,1000]} o= c i
+    if [[ $s == *[^A-Za-z0-9\ _./=:@%+,-]* ]]; then
+      for ((i = 1; i <= ${#s}; i++)); do
+        c=$s[i]
+        if [[ $c == [^\ -\~] || $c == [\;\\] ]]; then
+          printf -v c '\\x%02x' "'$c"
+        fi
+        o+=$c
+      done
+      s=$o
+    fi
+    REPLY=$s
+  }
+
+  __nt_osc7() {
+    emulate -L zsh
+    setopt nomultibyte
+    local s=$PWD o= c i
+    if [[ $s == *[^A-Za-z0-9/._~-]* ]]; then
+      for ((i = 1; i <= ${#s}; i++)); do
+        c=$s[i]
+        [[ $c == [A-Za-z0-9/._~-] ]] || printf -v c '%%%02X' "'$c"
+        o+=$c
+      done
+      s=$o
+    fi
+    printf '\e]7;file://%s%s\a' "$HOST" "$s"
+  }
+
+  # First in precmd_functions so that $? is still the command's status.
+  __nt_precmd() {
+    local ec=$?
+    if [[ -n $__nt_running ]]; then
+      printf '\e]133;D;%s\a' "$ec"
+      __nt_running=
+    fi
+    __nt_osc7
+    printf '\e]133;A\a'
+    return $ec
+  }
+
+  __nt_preexec() {
+    __nt_enc "$1"
+    __nt_running=1
+    printf '\e]133;E;%s\a\e]133;C\a' "$REPLY"
+  }
+
+  precmd_functions=(__nt_precmd $precmd_functions)
+  preexec_functions+=(__nt_preexec)
+fi

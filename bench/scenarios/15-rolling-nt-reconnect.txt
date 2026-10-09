@@ -1,0 +1,19 @@
+# gold: name: nt-reconnect-logic | topic: nt reconnect logic: fixing and deploying
+cwd: ~/src/nt (git nt, branch reconnect)
+commands (oldest first):
+  [~/src/nt] git checkout -b reconnect  ok      0s
+  [~/src/nt] cargo build                ok      14s
+  [~/src/nt] vim src/proto.rs           ok      6m
+  [~/src/nt] cargo test                 exit 101 41s
+      | error[E0308]: mismatched types --> src/proto.rs:88
+      | error: could not compile `nt` (lib test) due to 1 previous error
+foreground: bash
+=== step 2
+cwd: ~/src/nt (git nt, branch reconnect)
+new commands since then (oldest first):
+  [~/src/nt] vim src/proto.rs  ok      3m
+  [~/src/nt] cargo test        ok      52s
+      | test result: ok. 31 passed; 0 failed
+  [~/src/nt] make deploy       running 3m
+      | Uploading 45%
+foreground: make deploy

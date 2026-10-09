@@ -1,0 +1,16 @@
+# gold: name: resnet-training-oom | topic: resnet training: fixing GPU out-of-memory
+cwd: ~/ml/resnet-cifar (git resnet-cifar, branch main)
+commands (oldest first):
+  [~/ml/resnet-cifar] nvidia-smi                           ok      1s
+      | | 0  NVIDIA RTX 3060   |  1MiB / 12288MiB |
+  [~/ml/resnet-cifar] python train.py --epochs 3           exit 1  35s
+      | torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.40 GiB
+foreground: bash
+=== step 2
+cwd: ~/ml/resnet-cifar (git resnet-cifar, branch main)
+new commands since then (oldest first):
+  [~/ml/resnet-cifar] vim configs/default.yaml                   ok      2m
+  [~/ml/resnet-cifar] python train.py --epochs 10 --batch 16     running 25m
+      | epoch 7/10 loss 0.314 acc 0.887
+files: configs/default.yaml
+foreground: python train.py --epochs 10 --batch 16

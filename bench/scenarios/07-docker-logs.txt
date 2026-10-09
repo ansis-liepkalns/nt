@@ -1,0 +1,8 @@
+# gold: name: shop-stack-logs | topic: shop stack: watching docker compose logs for 502s
+cwd: ~/work/shop-infra (git shop-infra, branch main)
+commands (oldest first):
+  [~/work/shop-infra] docker compose up -d           ok      22s
+  [~/work/shop-infra] docker compose ps              ok      1s
+  [~/work/shop-infra] docker compose logs -f web     running 9m
+      | web-1  | 172.18.0.1 - "GET /api/cart" 502 0.003
+foreground: docker compose logs -f web

@@ -1,0 +1,18 @@
+{
+ "system": "You label terminal sessions so a user can tell them apart in a list.\nYou get a digest: working directory, recent commands (oldest first, with status and duration, some with output lines) and the foreground program.\nReply with exactly two lines and nothing else:\nname: <2-4 lowercase words joined by hyphens>\ntopic: <at most 50 characters>\nRules:\n- Name the project, host or task, taken from the directory, git repo, branch or host. Do not just repeat the last command.\n- The topic says what the user is working on (the goal and the subject), not the status. Do not say 'running' or 'finished'.\n- Use only words that appear in the digest or are obviously implied by it. Do not invent details.\n- Sessions in the same repo must be told apart by what they do (frontend, database, tests, deploy...).",
+ "shots": [
+  [
+   "cwd: ~/src/pixelforge (git pixelforge, branch gpu-resize)\ncommands (oldest first):\n  [~/src/pixelforge] cmake --build build -j8        ok      2m10s\n  [~/src/pixelforge] ./build/bench_resize           ok      30s\n      | lanczos 4096x4096: 11.2 ms\n  [~/src/pixelforge] vim shaders/resize.comp        running 9m\nforeground: vim shaders/resize.comp",
+   "name: pixelforge-shaders\ntopic: pixelforge: tuning GPU resize shader after benchmark"
+  ],
+  [
+   "cwd: ~/infra/k8s (git infra, branch prod-rollout)\ncommands (oldest first):\n  [~/infra/k8s] kubectl get pods -n payments        ok      1s\n  [~/infra/k8s] kubectl rollout status deploy/api   exit 1  5m\n      | error: deployment \"api\" exceeded its progress deadline\n  [~/infra/k8s] kubectl logs deploy/api --tail=50   ok      1s\n      | panic: dial tcp 10.0.3.7:5432: connect: connection refused\nforeground: bash",
+   "name: payments-rollout\ntopic: payments api rollout stuck, db connection refused"
+  ],
+  [
+   "cwd: ~/Videos/trip\ncommands (oldest first):\n  [~/Videos/trip] ls                                ok      0s\n  [~/Videos/trip] ffmpeg -i clip01.mov -c:v libx265 out01.mp4 running 6m\n      | frame= 4210 fps= 31 q=28.0\nforeground: ffmpeg -i clip01.mov -c:v libx265 out01.mp4",
+   "name: trip-video-encode\ntopic: encoding trip videos to h265"
+  ]
+ ],
+ "suffix": ""
+}

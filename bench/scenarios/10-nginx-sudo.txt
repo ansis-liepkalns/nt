@@ -1,0 +1,9 @@
+# gold: name: nginx-reload-fix | topic: nginx: editing vhost config, reload failing
+cwd: /etc/nginx/sites-available (host web02)
+commands (oldest first):
+  [/etc/nginx/sites-available] sudo vim blog.conf         ok      8m
+  [/etc/nginx/sites-available] sudo nginx -t              exit 1  0s
+      | nginx: [emerg] unknown directive "proxy_passs" in /etc/nginx/sites-enabled/blog.conf:14
+  [/etc/nginx/sites-available] sudo systemctl reload nginx exit 1 1s
+      | Job for nginx.service failed because the control process exited with error code.
+foreground: bash

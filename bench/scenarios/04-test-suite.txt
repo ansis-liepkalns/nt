@@ -1,0 +1,9 @@
+# gold: name: billing-tests | topic: billing service: running pytest suite after refactor
+cwd: ~/work/billing (git billing, branch refactor-invoices)
+commands (oldest first):
+  [~/work/billing] git status                           ok      0s
+  [~/work/billing] pytest tests/unit -q                 ok      14s
+      | 212 passed in 13.80s
+  [~/work/billing] pytest tests/integration -x          running 2m
+      | tests/integration/test_invoice_flow.py ....F
+foreground: pytest tests/integration -x

@@ -1,0 +1,23 @@
+{
+"01-editor-config": [["webshop","shop"],["config","yaml","production"]],
+"02-make-ok": [["zstd"],["build","compil","make","release"]],
+"03-build-failing": [["chatd","chat","hub","tokio"],["borrow","error","fix","build","compil","cargo","async","broadcast"]],
+"04-test-suite": [["billing","invoice"],["test","pytest","integration"]],
+"05-rebase-conflict": [["dotfiles","zsh","alias"],["rebase","conflict","merge"]],
+"06-ssh-apt": [["nas"],["apt","upgrade","update","package"]],
+"07-docker-logs": [["shop"],["docker","compose","log","502"]],
+"08-htop": [["htop","monitor","cpu","system","process","resource"]],
+"09-python-analysis": [["sales"],["analy","ipython","pandas","revenue","data"]],
+"10-nginx-sudo": [["nginx","web02","blog"],["config","reload","vhost","proxy","fix","error"]],
+"11-kernel-module": [["nvme"],["module","kernel","kmod","insmod","driver"]],
+"12-latex": [["diffusion","paper"],["latex","bib","citation","refs","latexmk"]],
+"13-idle": [["project","home","shell","idle","browsing","listing","directory","folder"]],
+"14a-frontend-dev": [["acme"],["frontend","web","vite","dev","npm","dashboard","ui"]],
+"14b-db-migration": [["acme"],["db","database","migrat","alembic","postgres","schema","tenant"]],
+"15-rolling-nt-reconnect#1": [["nt"],["proto","test","type","error","build"]],
+"15-rolling-nt-reconnect#2": [["nt"],["deploy","pass","fixed"]],
+"16-rolling-nas-upgrade#1": [["nas01","nas"],["apt","upgrade","update","package"]],
+"16-rolling-nas-upgrade#2": [["nas01","nas"],["reboot","rebooted","restart"],["upgrade","apt","package","kernel"]],
+"17-rolling-train-oom#1": [["resnet","cifar","train"],["memory","oom","cuda"]],
+"17-rolling-train-oom#2": [["resnet","cifar","train"],["batch","config"],["memory","oom","cuda"]]
+}

@@ -1,0 +1,8 @@
+# gold: name: diffusion-paper | topic: LaTeX paper on diffusion sampling: fixing bibliography
+cwd: ~/papers/diffusion-sampling (git diffusion-sampling, branch camera-ready)
+commands (oldest first):
+  [~/papers/diffusion-sampling] latexmk -pdf main.tex   ok      19s
+  [~/papers/diffusion-sampling] vim refs.bib            ok      11m
+  [~/papers/diffusion-sampling] latexmk -pdf main.tex   exit 12 8s
+      | ! Package natbib Error: Bibliography not compatible with author-year citations.
+foreground: bash
