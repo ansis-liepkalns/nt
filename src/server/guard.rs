@@ -6,8 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const MIB: u64 = 1 << 20;
-/// Memory pressure (`some avg10`, percent of time stalled) above which no run starts.
+/// Memory pressure (`some avg10`, percent of time stalled) above which no run starts while free memory is tight.
 pub const PRESSURE_MAX: f64 = 5.0;
+/// With plenty of headroom (free memory at least `ROOMY` times what the run needs) busy machines often show a few
+/// percent of pressure from unrelated work; only severe pressure blocks a run then.
+pub const PRESSURE_MAX_ROOMY: f64 = 25.0;
+pub const ROOMY: u64 = 3;
 /// Extra free memory demanded on top of the estimate.
 pub const MARGIN: u64 = 1024 * MIB;
 /// A namer batch running longer than this is killed.
@@ -58,8 +62,9 @@ pub fn may_start(
     if avail < need {
         return Err(format!("not enough free memory ({} MiB available, {} MiB needed)", avail / MIB, need / MIB));
     }
+    let limit = if avail >= need * ROOMY { PRESSURE_MAX_ROOMY } else { PRESSURE_MAX };
     if let Some(p) = pressure.and_then(parse_pressure)
-        && p >= PRESSURE_MAX
+        && p >= limit
     {
         return Err(format!("memory pressure (avg10 {p:.1})"));
     }
@@ -151,6 +156,10 @@ mod tests {
         let busy = "some avg10=5.00 avg60=1 avg300=1 total=1\n";
         assert!(may_start(MEM, Some(busy), gb, false, false).unwrap_err().contains("pressure"));
         assert!(may_start(MEM, Some("some avg10=4.99 avg60=1 avg300=1 total=1\n"), gb, false, false).is_ok());
+        // plenty of headroom (12 GB free vs 2.6 GB needed): moderate pressure from other work is tolerated
+        let roomy = "MemTotal: 128000000 kB\nMemAvailable: 12000000 kB\n";
+        assert!(may_start(roomy, Some("some avg10=6.70 avg60=5 avg300=5 total=1\n"), gb, false, false).is_ok());
+        assert!(may_start(roomy, Some("some avg10=25.0 avg60=5 avg300=5 total=1\n"), gb, false, false).is_err());
         assert!(may_start(MEM, None, gb, false, false).is_ok()); // no PSI support
         // battery
         assert!(may_start(MEM, Some(PSI), gb, true, false).unwrap_err().contains("battery"));

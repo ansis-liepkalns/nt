@@ -281,7 +281,7 @@ foreground: make deploy
   key = blake3 of model path, size, prefix tokens and `n_ctx` (constant: prefix + 700 + 130 + 16, so it does not depend on the jobs). Other `prefix-*` files are
   deleted. Measured with Granite 1B on this machine (debug build, 2 threads, idle priority): first result after opening the switcher 26.4 s cold, 6.3 s warm; the state file is 121 MB.
 - **Resource safety** (`src/server/guard.rs`, pure functions over /proc and /sys text, unit tested): before a local run `MemAvailable >= model x 1.3 + 300 MiB + 1 GiB`,
-  `some avg10 < 5` and not on battery (config `llm_on_battery`, default false), else the run is postponed (logged once per episode, dirty flags stay). The child sets `oom_score_adj` 1000,
+  `some avg10 < 5` (`< 25` when free memory is at least 3x the need) and not on battery (config `llm_on_battery`, default false), else the run is postponed (logged once per episode, dirty flags stay). The child sets `oom_score_adj` 1000,
   loads weights with mmap, uses `llm_threads` (auto: nproc/2 <=16 for prompt, nproc/4 <=8 for generation), and is capped by `systemd-run --user --scope -p MemoryMax=<estimate+256 MiB> -p MemorySwapMax=0 -p CPUWeight=1`
   (probed once; it execs in place, started through `/proc/<daemon pid>/exe`), else `RLIMIT_DATA` = estimate + 512 MiB (private mappings only, file-backed weights are not counted).
   A watchdog thread in the daemon polls every second and SIGKILLs the child when `MemAvailable < max(5% of MemTotal, 512 MiB)` or after 180 s; that counts as a failed batch.

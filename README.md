@@ -166,7 +166,7 @@ The local model is built not to bother you or the machine:
   from llama-bench measurements; a number N means N and min(N, 8). The cgroup scope sets only `CPUWeight=1` (no quota), so idle
   cores are fully used and anything else that wants the CPU wins.
 - Memory: the weights are memory-mapped (file-backed, reclaimable). A run starts only if `MemAvailable` covers the model
-  (file size x 1.3 + 300 MiB) plus a 1 GiB margin and memory pressure (`/proc/pressure/memory`, `some avg10`) is below 5;
+  (file size x 1.3 + 300 MiB) plus a 1 GiB margin and memory pressure (`/proc/pressure/memory`, `some avg10`) is below 5 (below 25 when at least 3x the needed memory is free, so a busy but roomy machine still gets summaries);
   otherwise it is postponed and retried (logged once). The child has `oom_score_adj` 1000 (the kernel kills it first) and a hard
   cap: it runs in a `systemd-run --user --scope -p MemoryMax=... -p CPUWeight=1` scope when that works, else under `RLIMIT_DATA`.
   The daemon polls every second and kills the child if `MemAvailable` falls below 5% of RAM (at least 512 MiB) or it runs over 180 s.
