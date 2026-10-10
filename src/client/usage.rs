@@ -44,7 +44,7 @@ pub enum Layout {
 pub fn layout(cols: usize) -> Layout {
     match cols {
         70.. => Layout::Wide,
-        50..=69 => Layout::Mid,
+        51..=69 => Layout::Mid,
         _ => Layout::Narrow,
     }
 }
@@ -188,5 +188,6 @@ mod tests {
         assert_eq!(layout(100), Layout::Wide);
         assert_eq!(layout(60), Layout::Mid);
         assert_eq!(layout(40), Layout::Narrow);
+        assert_eq!((layout(50), layout(51)), (Layout::Narrow, Layout::Mid));
     }
 }

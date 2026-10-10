@@ -515,3 +515,222 @@ fn new_session_starts_in_requested_cwd() {
         let _ = marker;
     }
 }
+
+// ---------------------------------------------------------------- live numbers, branch and stale summaries
+
+impl Conn {
+    /// Read pushes until `f` accepts one; fails after `secs`. Returns the accepted list and the gaps between pushes seen.
+    fn until(&mut self, secs: u64, mut f: impl FnMut(&[SessionInfo]) -> bool) -> (Vec<SessionInfo>, Vec<Duration>) {
+        let t0 = Instant::now();
+        let (mut last, mut gaps) = (Instant::now(), Vec::new());
+        while t0.elapsed() < Duration::from_secs(secs) {
+            if let S2C::Sessions(v) = self.recv() {
+                gaps.push(last.elapsed());
+                last = Instant::now();
+                if f(&v) {
+                    return (v, gaps);
+                }
+            }
+        }
+        panic!("condition not reached within {secs}s");
+    }
+}
+
+fn session(v: &[SessionInfo], id: SessionId) -> &SessionInfo {
+    v.iter().find(|s| s.id == id).expect("session in list")
+}
+
+/// A burner started in a session shows up in the unsolicited pushes of a watching client within a few seconds,
+/// and disappears again after it is killed; the pushes keep coming every ~2 s while the switcher is open.
+#[test]
+fn cpu_and_memory_pushes_follow_a_burner_while_watching() {
+    let d = Daemon::start_with(&[], "/usr/bin/bash");
+    let mut c = d.connect();
+    let id = c.attach(None, None);
+    c.input("echo ready-$((1+1))\n");
+    c.wait_output("ready-2");
+    let mut w = d.connect();
+    w.send(&C2S::Watch(true));
+    // idle first
+    let (v, _) = w.until(8, |v| v.iter().any(|s| s.id == id && s.rss_bytes > 0));
+    assert!(session(&v, id).cpu_pct < 30.0, "idle cpu {}", session(&v, id).cpu_pct);
+    for round in 0..2 {
+        c.input("yes >/dev/null &\n");
+        let (v, gaps) = w.until(12, |v| session(v, id).cpu_pct > 50.0);
+        assert!(session(&v, id).rss_bytes > 100_000);
+        assert!(gaps.iter().all(|g| *g < Duration::from_millis(3500)), "round {round}: pushes too far apart: {gaps:?}");
+        c.input("kill $!\n");
+        let (v, _) = w.until(12, |v| session(v, id).cpu_pct < 20.0);
+        assert!(session(&v, id).cpu_pct < 20.0);
+    }
+}
+
+/// A switcher opened after a long idle time gets fresh numbers at once: memory immediately, CPU within a second.
+#[test]
+fn opening_the_switcher_refreshes_idle_sampled_numbers() {
+    let d = Daemon::start_with(&[], "/usr/bin/bash");
+    let mut c = d.connect();
+    let id = c.attach(None, None);
+    c.input("yes >/dev/null &\n");
+    std::thread::sleep(Duration::from_millis(700));
+    let mut w = d.connect();
+    w.send(&C2S::Watch(true));
+    // the first push after Watch(true) has memory; a CPU figure follows well before the regular 2 s period
+    let t0 = Instant::now();
+    let (v, _) = w.until(6, |v| session(v, id).cpu_pct > 50.0);
+    assert!(session(&v, id).rss_bytes > 100_000);
+    assert!(t0.elapsed() < Duration::from_millis(2500), "took {:?}", t0.elapsed());
+    c.input("kill $!\n");
+}
+
+/// A tiny OpenAI-compatible server on localhost: records every request body and answers with `reply(n, body)`.
+fn fake_llm(reply: impl Fn(usize, &str) -> String + Send + 'static) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = bodies.clone();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let (head_end, len) = loop {
+                let n = s.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    break (0, 0);
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
+                    let len = head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+                    break (p + 4, len);
+                }
+            };
+            while head_end > 0 && buf.len() < head_end + len {
+                let n = s.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let body = String::from_utf8_lossy(&buf[head_end.min(buf.len())..]).into_owned();
+            let n = {
+                let mut g = seen.lock().unwrap();
+                g.push(body.clone());
+                g.len() - 1
+            };
+            let content = reply(n, &body).replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+            let json = format!("{{\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":\"{content}\"}}}}]}}");
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}", json.len());
+        }
+    });
+    (port, bodies)
+}
+
+fn api_env(port: u16, tag: &str) -> Vec<(&'static str, String)> {
+    let cfg = std::env::temp_dir().join(format!("nt-test-cfg-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(cfg.join("nt")).unwrap();
+    std::fs::write(cfg.join("nt/config.toml"), format!("llm = \"api\"\nllm_api_url = \"http://127.0.0.1:{port}/v1/chat/completions\"\nllm_api_key_env = \"NT_TEST_KEY\"\n")).unwrap();
+    vec![("XDG_CONFIG_HOME", cfg.display().to_string()), ("NT_TEST_KEY", "k".into())]
+}
+
+/// A build that was started, summarized while running and then interrupted: the summary is flagged as older than the
+/// last command at once, opening the switcher shows it pending and refreshes it with the interrupted command in the digest,
+/// and a sentence that still claims the build runs is dropped from the new summary.
+#[test]
+fn interrupted_build_marks_the_summary_stale_and_opening_refreshes_it() {
+    let (port, bodies) = fake_llm(|n, _| {
+        if n == 0 {
+            "name: build-session\ntopic: building the project\nsummary: Started a long build in the home directory. The build is currently running for 3 minutes.".to_string()
+        } else {
+            "name: build-session\ntopic: build was interrupted\nsummary: Started a long build and stopped it with Ctrl-C. The build is still running. No further commands were run.".to_string()
+        }
+    });
+    let env = api_env(port, "stale");
+    let d = Daemon::start_with(&env, "/usr/bin/bash");
+    let mut c = d.connect();
+    let id = c.attach(None, None);
+    c.input("echo ready-$((1+1))\n");
+    c.wait_output("ready-2");
+    c.input("sleep 300\n");
+    std::thread::sleep(Duration::from_millis(500));
+    let mut w = d.connect();
+    w.attach(Some(id), None);
+    w.send(&C2S::Watch(true));
+    let (v, _) = w.until(30, |v| !session(v, id).summary.is_empty() && !session(v, id).pending);
+    let s = session(&v, id);
+    assert!(s.summary.contains("currently running"), "a running command keeps its summary: {}", s.summary);
+    assert!(!s.summary_stale && s.summary_unix > 0, "fresh while the build still runs");
+    // Ctrl-C: the command ends (OSC 133 D with 130); the summary now predates the last command end.
+    c.input("\x03");
+    let (v, _) = w.until(10, |v| session(v, id).summary_stale);
+    assert!(session(&v, id).status.starts_with('✗'), "status {}", session(&v, id).status);
+    // Close and open the switcher: pending first, then a refreshed, no longer stale summary.
+    w.send(&C2S::Watch(false));
+    std::thread::sleep(Duration::from_millis(300));
+    let t0 = Instant::now();
+    w.send(&C2S::Watch(true));
+    let (_, _) = w.until(10, |v| session(v, id).pending);
+    let (v, _) = w.until(30, |v| !session(v, id).pending && session(v, id).summary.contains("Ctrl-C"));
+    let s = session(&v, id);
+    assert!(t0.elapsed() < Duration::from_secs(5), "took {:?}", t0.elapsed());
+    assert!(!s.summary_stale, "refreshed");
+    assert!(!s.summary.contains("still running") && s.summary.contains("No further commands"), "live sentence dropped: {}", s.summary);
+    let second = bodies.lock().unwrap()[1].clone();
+    assert!(second.contains("exit 130") && second.contains("sleep 300"), "digest lacks the interrupted command: {second}");
+    assert!(second.contains("earlier summary: Started a long build in the home directory.") && !second.contains("for 3 minutes"), "the old summary's live claim must not be fed back: {second}");
+}
+
+/// A `git checkout` (here: .git/HEAD rewritten, also through a worktree-style `.git` file) changes the branch shown, marks
+/// the summary stale without any command, and the next refresh tells the model about the branch change.
+#[test]
+fn branch_change_is_pushed_and_triggers_a_new_summary() {
+    let (port, bodies) = fake_llm(|n, _| format!("name: repo-work\ntopic: working on topic number {n}\nsummary: Looked around the repository and listed its files."));
+    let env = api_env(port, "branch");
+    let d = Daemon::start_with(&env, "/usr/bin/bash");
+    let repo = d.dir.join("home/shop");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    // a worktree: `.git` is a file pointing at a gitdir
+    let wt = d.dir.join("home/shop-wt");
+    std::fs::create_dir_all(&wt).unwrap();
+    std::fs::create_dir_all(d.dir.join("wtgit")).unwrap();
+    std::fs::write(d.dir.join("wtgit/HEAD"), "ref: refs/heads/hotfix/1\n").unwrap();
+    std::fs::write(wt.join(".git"), format!("gitdir: {}\n", d.dir.join("wtgit").display())).unwrap();
+    let mk = |dir: &std::path::Path| {
+        let mut c = d.connect();
+        c.send(&C2S::Attach { session: None, cols: 80, rows: 24, term: "xterm".into(), resume_from: None, cwd: Some(dir.display().to_string()) });
+        let id = loop {
+            if let S2C::Attached { session } = c.recv() {
+                break session;
+            }
+        };
+        c.input("ls -la\n");
+        (c, id)
+    };
+    let (mut c1, id1) = mk(&repo);
+    let (_c2, id2) = mk(&wt);
+    c1.wait_output("total");
+    std::thread::sleep(Duration::from_millis(500));
+    let mut w = d.connect();
+    w.attach(Some(id1), None);
+    w.send(&C2S::Watch(true));
+    let (v, _) = w.until(30, |v| !session(v, id1).summary.is_empty() && !session(v, id2).summary.is_empty() && !v.iter().any(|s| s.pending));
+    assert_eq!((session(&v, id1).branch.as_str(), session(&v, id2).branch.as_str()), ("main", "hotfix/1"));
+    assert!(!session(&v, id1).summary_stale);
+    let n_before = bodies.lock().unwrap().len();
+    // switch branches behind the shell's back; the watching client is told within a couple of sampling periods
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feature/coupons\n").unwrap();
+    let (v, _) = w.until(8, |v| session(v, id1).branch == "feature/coupons");
+    assert!(session(&v, id1).summary_stale && session(&v, id2).branch == "hotfix/1");
+    // reopening refreshes the session even though no command ran, and the digest says what changed
+    w.send(&C2S::Watch(false));
+    std::thread::sleep(Duration::from_millis(200));
+    w.send(&C2S::Watch(true));
+    let (v, _) = w.until(30, |v| !session(v, id1).summary_stale && !v.iter().any(|s| s.pending) && bodies.lock().unwrap().len() > n_before);
+    assert!(!session(&v, id1).pending);
+    let all = bodies.lock().unwrap();
+    let last = all.iter().rev().find(|b| b.contains("feature/coupons")).expect("a digest mentioning the new branch");
+    assert!(last.contains("branch changed since the earlier summary: main -> feature/coupons"), "{last}");
+    assert_eq!(all.len(), n_before + 1, "only the session whose branch changed is summarized again");
+}

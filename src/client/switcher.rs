@@ -7,6 +7,8 @@ use crate::proto::{GroupInfo, SearchHit, SessionId, SessionInfo};
 
 /// Rows of the summary area, and the least terminal height (rows) that shows it.
 const DETAIL_ROWS: usize = 3;
+/// Width of the age column (`59s`, `23h`, `999d`); fixed so that the usage column lines up on every row and header.
+const AGE_W: usize = 4;
 const DETAIL_MIN_ROWS: usize = 20;
 
 /// Quiet time after the last keystroke before a full-text search is sent.
@@ -623,9 +625,45 @@ impl Switcher {
         if self.detail && !self.search && any && bh >= DETAIL_MIN_ROWS && lh >= need + DETAIL_ROWS { DETAIL_ROWS } else { 0 }
     }
 
+    /// The summary area of `s`: `(before last command)` in front of a summary that predates the last command end,
+    /// `updated 4m ago` (or `↻ updating…` and the spinner while a naming run is pending) at the end of the last line.
+    fn summary_lines(&self, s: &SessionInfo, iw: usize, dh: usize, now: u64) -> Vec<String> {
+        let w = iw.saturating_sub(2);
+        let tail = if s.pending {
+            format!("{} updating… {}", if self.ascii { "~" } else { "↻" }, self.spinner())
+        } else if s.summary_unix > 0 && !s.summary.is_empty() {
+            format!("updated {} ago", age(now, s.summary_unix))
+        } else {
+            String::new()
+        };
+        let body = if s.summary.is_empty() {
+            String::new()
+        } else if s.summary_stale {
+            format!("(before last command) {}", s.summary)
+        } else {
+            s.summary.clone()
+        };
+        let mut lines = wrap(&body, w, dh);
+        if !tail.is_empty() {
+            let tl = tail.chars().count();
+            let n = lines.len();
+            match lines.last_mut() {
+                None => lines.push(tail),
+                Some(last) if last.chars().count() + 3 + tl <= w => last.push_str(&format!(" · {tail}")),
+                Some(_) if n < dh => lines.push(tail),
+                Some(last) => {
+                    // The summary fills every row: keep the indicator, shorten the text before it.
+                    let keep: String = last.trim_end_matches('…').chars().take(w.saturating_sub(tl + 5)).collect();
+                    *last = format!("{}… · {tail}", keep.trim_end());
+                }
+            }
+        }
+        lines.into_iter().map(|l| fit(&format!(" {l}"), iw)).collect()
+    }
+
     /// Is there anything for the area under the list: a summary, or (group level) topics of group members.
     fn has_detail(&self) -> bool {
-        self.sessions.iter().any(|s| !s.summary.is_empty() || (s.group.is_some() && !s.recap.is_empty()))
+        self.sessions.iter().any(|s| !s.summary.is_empty() || s.pending || (s.group.is_some() && !s.recap.is_empty()))
     }
 
     pub fn set_naming_error(&mut self, e: &str) {
@@ -945,18 +983,21 @@ impl Switcher {
                 let ind = if g.is_some() { "  " } else { "" };
                 let mark = if Some(s.id) == self.current { '*' } else { ' ' };
                 let head = format!(" {ind}{mark}#{:<3} {} [{}] {} ", s.id, fit(&names[pos], name_w), s.clients, fit(if s.exited { "exited" } else { &s.fg_cmd }, 8));
-                let age = age(now, s.last_active_unix);
+                let age = format!("{:>w$}", age(now, s.last_active_unix), w = AGE_W);
                 let (res, res_w) = usage::cell(s, &scale, s.rss_bytes == top_rss && top_rss > 0, lay, self.ascii);
                 let fixed = head.chars().count() + age.len() + 1;
                 // Drop the usage cell when even a short cwd would not fit next to it.
                 let show = iw >= fixed + res_w + 1 + if lay == usage::Layout::Narrow { 0 } else { 8 };
                 let w = if show { res_w + 1 } else { 0 };
                 let place = g.map_or_else(|| s.cwd.clone(), |g| grouping::subdir(s, g));
-                let cwd = fit_left(&place, iw.saturating_sub(fixed + w));
+                let room = iw.saturating_sub(fixed + w);
                 let mut out = Vec::new();
                 if show {
+                    // Ungrouped sessions in a repository show the branch after the path (members: the group header has it).
+                    let cwd = place_cell(&place, if g.is_none() { &s.branch } else { "" }, room, self.ascii);
                     out.push((format!("{head}{cwd} {res} {age}"), selected as u8));
                 } else {
+                    let cwd = fit_left(&place, room);
                     out.push((fit(&format!("{head}{cwd} {age}"), iw), selected as u8));
                 }
                 let pad = " ".repeat(7 + ind.len());
@@ -981,13 +1022,14 @@ impl Switcher {
                 let g = &flat.groups[gi];
                 let members: Vec<&SessionInfo> = g.members.iter().map(|&i| &self.sessions[i]).collect();
                 let icons = grouping::icons(members.iter().copied());
-                let compact = bw <= 50;
+                let compact = lay == usage::Layout::Narrow;
                 let mut sum = members[0].clone();
                 (sum.cpu_pct, sum.rss_bytes) = group_sums[gi];
                 let (res, res_w) = usage::cell(&sum, &scale, false, if compact { usage::Layout::Narrow } else { lay }, self.ascii);
                 let icon_w = if icons.is_empty() { 0 } else { icons.len() * 2 - 1 };
                 let sep = if icons.is_empty() { "" } else if compact { " " } else { "  " };
-                let (reserve, right_w) = if iw < 20 { (0, 0) } else { (if compact { 1 } else { 3 }, icon_w + sep.len() + res_w) };
+                // The usage cell ends where the session rows' does: before the age column.
+                let (reserve, right_w) = if iw < 20 { (0, 0) } else { (AGE_W + 1, icon_w + sep.len() + res_w) };
                 let right = if iw < 20 {
                     String::new()
                 } else {
@@ -997,10 +1039,24 @@ impl Switcher {
                 let avail = iw.saturating_sub(reserve + right_w);
                 let label: String = clean(&g.info.label).chars().take(avail.saturating_sub(2).max(1)).collect();
                 let label_w = label.chars().count();
-                let path_room = avail.saturating_sub(1 + label_w + 2);
-                let path = if !compact && g.info.shown != g.info.label && path_room >= 6 { fit_left(&g.info.shown, path_room).trim_end().to_string() } else { String::new() };
+                // Dim path, then the dim branch (the first member's; `+N` when members are on other branches too).
+                let branch = if compact { String::new() } else { group_branch(&members, self.ascii) };
+                let rest = avail.saturating_sub(1 + label_w);
+                let b_full = if branch.is_empty() { 0 } else { 2 + branch.chars().count() };
+                let want_path = if g.info.shown != g.info.label { 2 + g.info.shown.chars().count() } else { 0 };
+                let path_budget = rest.saturating_sub(b_full);
+                let (path_w, b_w) = if compact || want_path == 0 {
+                    (0, b_full.min(rest))
+                } else if path_budget >= want_path.min(8) {
+                    (want_path.min(path_budget), b_full)
+                } else {
+                    (0, b_full.min(rest))
+                };
+                let path = if path_w >= 5 { fit_left(&g.info.shown, path_w - 2).trim_end().to_string() } else { String::new() };
+                let branch = if b_w >= 6 { clip_ellipsis(&branch, b_w - 2) } else { String::new() };
                 let path_part = if path.is_empty() { String::new() } else { format!("  \x1b[2m{path}\x1b[22m") };
-                let used = 1 + label_w + if path.is_empty() { 0 } else { 2 + path.chars().count() };
+                let path_part = if branch.is_empty() { path_part } else { format!("{path_part}  \x1b[2m{branch}\x1b[22m") };
+                let used = 1 + label_w + if path.is_empty() { 0 } else { 2 + path.chars().count() } + if branch.is_empty() { 0 } else { 2 + branch.chars().count() };
                 let t = format!(" \x1b[1m{label}\x1b[22m{path_part}{}{right}\x1b[0m", " ".repeat(avail.saturating_sub(used)));
                 (t, 6 + selected as u8)
             };
@@ -1072,10 +1128,10 @@ impl Switcher {
                     }
                     v
                 }
-                _ => {
-                    let text = self.selected().map_or("", |s| s.summary.as_str());
-                    wrap(text, iw.saturating_sub(2), dh).into_iter().map(|l| fit(&format!(" {l}"), iw)).collect()
-                }
+                _ => match self.selected() {
+                    Some(s) => self.summary_lines(s, iw, dh, now),
+                    None => Vec::new(),
+                },
             }
         };
 
@@ -1284,6 +1340,51 @@ pub fn wrap(text: &str, w: usize, max: usize) -> Vec<String> {
     lines
 }
 
+/// `s` cut to `n` columns, ending in `…` if it was cut.
+fn clip_ellipsis(s: &str, n: usize) -> String {
+    let s = clean(s);
+    if s.chars().count() <= n {
+        return s;
+    }
+    let head: String = s.chars().take(n.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
+/// `⎇ feature/x` (`br: feature/x` in ASCII mode).
+fn branch_tag(branch: &str, ascii: bool) -> String {
+    format!("{} {}", if ascii { "br:" } else { "⎇" }, clean(branch))
+}
+
+/// The branch shown on a group header: the first member's, plus `+N` for the other distinct branches; empty outside repositories.
+fn group_branch(members: &[&SessionInfo], ascii: bool) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for m in members.iter().filter(|m| !m.branch.is_empty()) {
+        if !seen.contains(&m.branch.as_str()) {
+            seen.push(&m.branch);
+        }
+    }
+    match seen.split_first() {
+        None => String::new(),
+        Some((first, [])) => branch_tag(first, ascii),
+        Some((first, rest)) => format!("{} +{}", branch_tag(first, ascii), rest.len()),
+    }
+}
+
+/// The path column of a row: exactly `w` columns, the path (its end if too long) and, when there is room, the dim branch right after it.
+fn place_cell(path: &str, branch: &str, w: usize, ascii: bool) -> String {
+    const MIN_PATH: usize = 8;
+    if branch.is_empty() || w < MIN_PATH + 8 {
+        return fit_left(path, w);
+    }
+    let tag = clip_ellipsis(&branch_tag(branch, ascii), w - MIN_PATH - 2);
+    let tag_w = 2 + tag.chars().count();
+    let path_room = w - tag_w;
+    let n = path.chars().count();
+    let shown = if n <= path_room { clean(path) } else { fit_left(path, path_room) };
+    let pad = path_room - shown.chars().count();
+    format!("{shown}\x1b[2m  {tag}\x1b[22m{}", " ".repeat(pad))
+}
+
 /// Like `fit`, but keeps the end of the string (for paths), marking the cut with an ellipsis.
 fn fit_left(s: &str, w: usize) -> String {
     let n = s.chars().count();
@@ -1404,6 +1505,9 @@ mod tests {
             cpu_pct: 0.0,
             rss_bytes: 0,
             pending: false,
+            branch: String::new(),
+            summary_unix: 0,
+            summary_stale: false,
             group: None,
         }
     }
@@ -2457,5 +2561,126 @@ mod tests {
         // no groups, no advertising
         let mut sw = Switcher::new(vec![info(1, "calm-otter", 0, 1)], None);
         assert!(!screen(&mut sw, 140, 24).iter().any(|l| l.contains("groups")));
+    }
+
+    /// Sessions of two groups and two loose ones, with different ages and loads (so every number has its own width).
+    fn loaded() -> Vec<SessionInfo> {
+        let mut v = grouped();
+        for (i, (cpu, rss, age)) in [(5.0, 40u64 << 20, 5), (123.0, 900 << 20, 700), (7.0, 3 << 30, 11000), (250.0, 12 << 20, 90000), (66.0, 60 << 20, 3), (1.0, 5 << 20, 2_000_000)].into_iter().enumerate() {
+            v[i].cpu_pct = cpu;
+            v[i].rss_bytes = rss;
+            v[i].last_active_unix = 3_000_000 - age;
+        }
+        v
+    }
+
+    #[test]
+    fn usage_cells_line_up_on_headers_members_and_loose_rows_at_every_width() {
+        for (cols, rows) in [(100u16, 40u16), (80, 30), (70, 30), (69, 30), (60, 30), (51, 30), (50, 30), (45, 30)] {
+            let mut sw = Switcher::new(loaded(), Some(3));
+            sw.ascii = false;
+            let out = sw.render(cols, rows, 3_000_000);
+            let scr: Vec<String> = (1..=rows as usize).map(|r| text_at(&out, r)).collect();
+            // every header and session row (not the status/topic lines): lines holding a name of the list
+            let entry: Vec<&String> = scr.iter().filter(|l| ["│ a ", "│ b ", "│ c ", "a-one", "a-two", "b-one", "c-one", "loose-one", "loose-two"].iter().any(|k| l.contains(k))).collect();
+            assert!(entry.len() >= 9, "{cols}: {scr:?}");
+            let width = cols as usize;
+            let lay = usage::layout(width);
+            let cell_w = match lay {
+                usage::Layout::Wide => 22,
+                usage::Layout::Mid => 9,
+                usage::Layout::Narrow => 1,
+            };
+            // The cell ends one space + the age column before the right border, on every line.
+            let end = width - 1 - (AGE_W + 1);
+            for l in &entry {
+                let c: Vec<char> = l.chars().collect();
+                assert_eq!(c.len(), width, "{l}");
+                let cell: String = c[end - cell_w..end].iter().collect();
+                assert_eq!(c[end], ' ', "{cols}: {l}");
+                if lay == usage::Layout::Wide {
+                    // right-aligned numbers: `NNN%` ends at the same column, the memory unit at the cell end
+                    assert_eq!(cell.chars().nth(9), Some('%'), "{cols}: {l:?} cell {cell:?}");
+                    assert!(matches!(c[end - 1], 'M' | 'G' | 'K'), "{cols}: {l:?}");
+                    assert_eq!(c[end - 6], ' ', "{cols}: {l:?}");
+                } else {
+                    // bars / heat glyphs (idle sessions have blank ones) appear only inside the cell
+                    let pos: Vec<usize> = c.iter().enumerate().filter(|(i, ch)| *i > 3 && "▏▎▍▌▋▊▉█▁▃▅▇".contains(**ch)).map(|(i, _)| i).collect();
+                    assert!(pos.iter().all(|&i| (end - cell_w..end).contains(&i)), "{cols}: {l:?} glyphs at {pos:?}");
+                }
+                // the age column is the same width on every line that has one (members and loose rows)
+                if l.contains("-one") || l.contains("-two") {
+                    let age: String = c[end + 1..width - 1].iter().collect();
+                    assert!(age.trim_start().ends_with(['s', 'm', 'h', 'd']) && age.chars().count() == AGE_W, "{cols}: {l:?} age {age:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn branch_on_group_headers_and_repo_rows() {
+        let mut list = grouped();
+        list[2].branch = "feature/coupons".into(); // b-one, the only member of group b
+        list[0].branch = "main".into(); // a-one
+        list[1].branch = "dev".into(); // a-two, another branch in the same group
+        list[4].branch = "fix/x".into(); // loose-one, in a repo
+        let mut sw = Switcher::new(list, Some(3));
+        sw.ascii = false;
+        let scr = screen(&mut sw, 100, 40);
+        let at = |needle: &str| scr.iter().position(|l| l.contains(needle)).unwrap();
+        let hb = &scr[at("│ b ")];
+        assert!(hb.contains("b  ~/b  ⎇ feature/coupons"), "{hb}");
+        let ha = &scr[at("│ a ")];
+        assert!(ha.contains("~/a  ⎇ dev +1"), "{ha}");
+        // the branch of a loose session follows its path; sessions without a repository get nothing
+        let l1 = &scr[at("loose-one")];
+        assert!(l1.contains("/tmp  ⎇ fix/x"), "{l1}");
+        assert!(!scr[at("loose-two")].contains('⎇'));
+        // members do not repeat it
+        assert!(!scr[at("b-one")].contains('⎇'));
+        assert!(scr.iter().all(|l| l.chars().count() == 100));
+        // escapes: the branch is dim
+        let out = sw.render(100, 40, 100);
+        assert!(out.contains("\x1b[2m⎇ feature/coupons\x1b[22m"), "{out:?}");
+        // narrow widths keep the line within the box and drop the branch before the path
+        for cols in [80u16, 60, 50, 40] {
+            let out = sw.render(cols, 30, 100);
+            assert!(rows_of(&out).iter().all(|(_, t)| t.chars().count() <= cols as usize), "{cols}");
+        }
+        // ASCII mode has no special glyph
+        sw.ascii = true;
+        let out = sw.render(100, 40, 100);
+        assert!(!out.contains('⎇') && out.contains("br: feature/coupons"));
+    }
+
+    #[test]
+    fn summary_area_tells_how_old_the_summary_is() {
+        let mut a = with_summary(info(1, "calm-otter", 0, 50), "Started the build in ~/src/nt.");
+        a.summary_unix = 1000 - 240;
+        let mut sw = Switcher::new(vec![a.clone(), info(2, "brave-lynx", 0, 10)], None);
+        let d = |sw: &mut Switcher| -> String { (19..=22).map(|r| text_at(&sw.render(80, 24, 1000), r)).collect::<Vec<_>>().join("|") };
+        let t = d(&mut sw);
+        assert!(t.contains("Started the build in ~/src/nt. · updated 4m ago") && !t.contains("before last command"), "{t}");
+        // a command ended after the summary was made
+        a.summary_stale = true;
+        sw.update(vec![a.clone(), info(2, "brave-lynx", 0, 10)], None);
+        let t = d(&mut sw);
+        assert!(t.contains("(before last command) Started the build") && t.contains("updated 4m ago"), "{t}");
+        // pending: the spinner and `updating…`, the stale marker stays until the new summary arrives
+        a.pending = true;
+        sw.update(vec![a.clone(), info(2, "brave-lynx", 0, 10)], None);
+        let t = d(&mut sw);
+        assert!(t.contains("(before last command)") && t.contains("↻ updating…") && !t.contains("updated 4m"), "{t}");
+        // a long summary keeps the indicator on its last line
+        let mut b = with_summary(info(1, "calm-otter", 0, 50), &"word ".repeat(80));
+        b.summary_unix = 1000 - 5;
+        sw.update(vec![b, info(2, "brave-lynx", 0, 10)], None);
+        let t = d(&mut sw);
+        assert!(t.contains("updated 5s ago") && t.contains('…'), "{t}");
+        // a pending session without a summary yet still shows that it is being worked on
+        let mut c = info(1, "calm-otter", 0, 50);
+        c.pending = true;
+        let mut sw = Switcher::new(vec![c, info(2, "brave-lynx", 0, 10)], None);
+        assert!(d(&mut sw).contains("updating…"));
     }
 }

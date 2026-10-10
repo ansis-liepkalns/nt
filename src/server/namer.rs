@@ -167,6 +167,57 @@ pub fn sanitize_summary(raw: &str) -> Option<String> {
     Some(out)
 }
 
+/// Phrases that state what is going on right now; the status line shows live state, a summary is history.
+const LIVE_PHRASES: &[&str] = &["currently", "is running", "are running", "still running", "in progress", "has been running", "have been running", "is building", "is compiling", "is still "];
+
+/// `for 5 minutes`, `for about 10 min`, `for 2h`: an elapsed time that is only true while something runs.
+fn has_elapsed(low: &str) -> bool {
+    const UNITS: &[&str] = &["s", "m", "h", "sec", "secs", "second", "seconds", "min", "mins", "minute", "minutes", "hr", "hrs", "hour", "hours"];
+    const FILLER: &[&str] = &["about", "over", "nearly", "almost", "around", "more", "than", "the", "last", "roughly"];
+    let w: Vec<&str> = low.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')')).filter(|x| !x.is_empty()).collect();
+    let word = |i: usize| w.get(i).map_or("", |t| t.trim_end_matches(['.', '!', '?']));
+    (0..w.len()).filter(|&i| w[i] == "for").any(|i| {
+        let mut j = i + 1;
+        while FILLER.contains(&word(j)) {
+            j += 1;
+        }
+        let t = word(j);
+        let rest = t.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+        let has_num = rest.len() < t.len();
+        has_num && ((rest.is_empty() && UNITS.contains(&word(j + 1))) || UNITS.contains(&rest))
+    })
+}
+
+/// Drop the sentences of a summary that claim live state ("currently building", "is still running", "for 5 minutes",
+/// "in progress"). `running`: a command is running right now, then the summary is left alone.
+/// `None` if nothing usable is left.
+pub fn drop_live_state(summary: &str, running: bool) -> Option<String> {
+    if running {
+        return Some(summary.to_string());
+    }
+    let mut sentences: Vec<&str> = Vec::new();
+    let mut start = 0;
+    let b = summary.as_bytes();
+    for i in 0..b.len() {
+        if matches!(b[i], b'.' | b'!' | b'?') && b.get(i + 1).is_none_or(|c| *c == b' ') {
+            sentences.push(summary[start..=i].trim());
+            start = i + 1;
+        }
+    }
+    if start < summary.len() {
+        sentences.push(summary[start..].trim());
+    }
+    let kept: Vec<&str> = sentences
+        .into_iter()
+        .filter(|x| !x.is_empty())
+        .filter(|x| {
+            let low = x.to_lowercase();
+            !LIVE_PHRASES.iter().any(|p| low.contains(p)) && !has_elapsed(&low)
+        })
+        .collect();
+    sanitize_summary(&kept.join(" "))
+}
+
 // ---------------------------------------------------------------- digest
 
 /// The command typed on a prompt-looking line (`user@host:~$ ls`, `$ ls`, `% ls`, `# ls`, `> ls`).
@@ -489,6 +540,29 @@ mod tests {
         assert!(session_ready(true, s(20), false));
         assert!(session_ready(true, s(0), true));
         assert!(is_ssh("ssh -p 22 host") && is_ssh("/usr/bin/ssh h") && !is_ssh("sshfs a b") && !is_ssh("echo ssh"));
+    }
+
+    #[test]
+    fn live_state_is_dropped_from_summaries_of_idle_sessions() {
+        let s = "Building the nt crate in ~/src/nt. The build is currently running for 5 minutes. Cargo reported a warning in proto.rs.";
+        assert_eq!(drop_live_state(s, false).as_deref(), Some("Building the nt crate in ~/src/nt. Cargo reported a warning in proto.rs."));
+        // a running command keeps its summary as it is
+        assert_eq!(drop_live_state(s, true).as_deref(), Some(s));
+        for live in [
+            "The deploy is still running.",
+            "The migration is in progress at 40%.",
+            "Compiling for about 10 minutes.",
+            "The build has been running for 2h.",
+            "It is building the project.",
+        ] {
+            let text = format!("Worked on the billing service in ~/work/billing and ran the tests. {live}");
+            assert_eq!(drop_live_state(&text, false).as_deref(), Some("Worked on the billing service in ~/work/billing and ran the tests."), "{live}");
+        }
+        // history stays: past tense, `after N minutes`, failures that "still" happen
+        let ok = "Ran the build, which failed after 5 minutes with a linker error. Retrying still fails to link.";
+        assert_eq!(drop_live_state(ok, false).as_deref(), Some(ok));
+        // nothing usable left
+        assert_eq!(drop_live_state("The build is currently running.", false), None);
     }
 
     #[test]

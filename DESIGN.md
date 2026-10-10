@@ -45,7 +45,13 @@ key list (`client/help.rs`), drawn over the current screen or switcher and remov
   (same id, transcript continues, attached clients get a `Redraw`). `C2S::Kill` on an exited session ends it at once; on a live one
   it SIGHUPs the shell and the session ends when the shell is gone. The clients never ask for confirmation on an exited session. Only closing sends `SessionEnded` (attached clients return to
   the switcher, or exit if it was the last session).
-- Per-session CPU and RSS (process tree, from /proc) are sampled while any client has the switcher open and pushed with `Sessions`.
+- Per-session CPU and RSS (process tree, from /proc) are sampled every 2 s while any client has the switcher open (every 30 s otherwise) and
+  pushed with `Sessions`. `Watch(true)` refreshes at once what the idle sampling left stale: RSS and the git branches are read immediately, the
+  CPU baseline is taken and the first CPU figure follows 0.7 s later (a figure averaged over the 30 s idle window would be meaningless).
+  A queued `Sessions` message is replaced by a newer one, so a slow link never delivers old numbers.
+- **Branch**: the server reads the git branch of each shell's cwd from `.git/HEAD` (worktrees through the `.git` file) on every Enter, OSC 133 `D`, naming
+  tick and, while a switcher is open, every sampling tick. A change marks the session dirty and `ctx_dirty` (a branch or group change is news by itself:
+  no new command is needed for a new summary). `SessionInfo.branch` is shown by the clients.
 
 ## Wire protocol (`src/proto.rs`)
 Frame = `u32 BE length` + payload; payload = `postcard`-encoded message (sealed over TCP). Max frame 1 MiB. Main messages:
@@ -73,7 +79,7 @@ enum S2C {
 }
 ```
 `SessionInfo` carries id, name, name source (`Initial | Heuristic | Llm | User`; `User` is locked), timestamps, client count, size,
-cwd, foreground command, status, topic (`recap`), summary, exited flag, cpu and rss, `group: Option<GroupInfo {key, label, shown}>`. `PROTO_VERSION` is 6 (`group`; before: `pending`, `S2C::NamerError`, `S2C::NamerPaused`).
+cwd, foreground command, status, topic (`recap`), summary, exited flag, cpu and rss, `group: Option<GroupInfo {key, label, shown}>`, `branch`, `summary_unix` and `summary_stale`. `PROTO_VERSION` is 7 (`branch`, `summary_unix`, `summary_stale`; before: `group`; before: `pending`, `S2C::NamerError`, `S2C::NamerPaused`).
 
 Version mismatch: `Hello` is the first variant of `C2S` and `proto` its first field, and the server decodes only that prefix of the first
 frame (`FrameReader::read_hello`), so any peer version is recognised even if other fields changed. On a mismatch the server sends
@@ -118,7 +124,10 @@ plaintext but sits in a 0700 directory.
   group. `GroupInfo.key` is the absolute root, `label` its basename (the whole path outside `$HOME`), `shown` the `~`-abbreviated path (the client
   does not know the server's home).
   Display: a header per group (bold label, dim path, status icons worst first `✗ ⏵ ✎ ✓` deduped and colored, summed CPU/RAM in the same
-  bar/number layout as session rows; at 50 columns and below only label, icons and a heat glyph). Members are indented by 2, show `subdir/`
+  bar/number layout as session rows; at 50 columns and below only label, icons and a heat glyph) and the dim current branch `⎇ feature/coupons` after the path
+  (the first member's, `+N` when members are on other branches; `br:` in ASCII mode). Ungrouped sessions in a repository show it after their path.
+  **Column alignment**: every row ends with a fixed 4-column right-aligned age; the usage cell (same layout tier as the rows) ends one column before it on group
+  headers, members and ungrouped rows alike. Layout tiers by box width: >= 70 bars with numbers, 51-69 bars, <= 50 one heat glyph. Members are indented by 2, show `subdir/`
   (relative to the root) instead of the cwd and lose a redundant `<label>:` prefix of heuristic names. Ungrouped sessions follow, in the old
   format. One blank line separates blocks (groups, and each ungrouped session) when everything including status and topic lines fits, never
   between the members of a group. Order, snapshotted when the switcher opens like the session order: the current session's group, then groups by
@@ -147,7 +156,9 @@ plaintext but sits in a 0700 directory.
   search over the summaries and the transcripts, newest first, at most 3 hits per session and 50 in total (a summary match comes first
   and is shown as `summary: …snippet`).
   **Summary area**: the rows between the list and the hint line are reserved for the SELECTED session's summary, word-wrapped to the
-  box width, at most 3 lines (the last ends in `…` if cut), dim. Rows are never added per entry. It is shown only when the box has at
+  box width, at most 3 lines (the last ends in `…` if cut), dim. Its last line ends with `· updated 4m ago`, or `· ↻ updating…` and the spinner while
+  the session's naming run is pending; a summary that predates a command that started or ended after it (`summary_stale`, also set by a branch/group change)
+  is prefixed `(before last command)` until it is refreshed. Rows are never added per entry. It is shown only when the box has at
   least 20 rows, the list keeps room for up to 8 entries above it and some session has a summary; otherwise it is hidden and `M-i`
   is not advertised. `M-i` toggles it (default on).
   **Closing**: `C-k` closes the selected session when the filter cursor is at the end of the filter text (where kill-line would do
@@ -165,7 +176,12 @@ plaintext but sits in a 0700 directory.
   clients (at most 1/s per session): `⏵ make -j8 · 3m12s` running, `✎ vim src/proto.rs` in an alt-screen app, `✓ cargo build · 2m ago`,
   `✗ cargo test (101) · 5s ago` (+ first error line when there is room), `idle · ~/src/nt`. Durations are placeholders
   (`{dur}`/`{ago}`) filled by the clients from `status_since`.
-- **Topic** (LLM): the goal of the session in at most 50 characters, describing the work and not the status, and not restating the last command.
+- **Topic** (LLM): what the session is about *right now* in at most 50 characters (newest commands, current branch and title decide; the rolling summary is history
+  and must not override them), describing the work and not the status, and not restating the last command. When the branch changed since the earlier summary the
+  digest says `branch changed since the earlier summary: A -> B`.
+- **Summary** (LLM): past-tense history of what was done and its outcomes. It must not state live state or durations; the status line shows that. The daemon
+  enforces it: `namer::drop_live_state` removes sentences with `currently`, `is running`, `still running`, `in progress`, `is building` or `for N minutes`
+  from a new summary when no command is running, and from the earlier summary before it is fed back into the digest.
 - **Summary** (LLM, rolling): 2-4 short factual sentences, at most 300 characters, of what has been done in the session overall (project or
   host, goal, what was tried, what happened, where it stands). Each run gets the previous summary plus the activity since, and updates it.
 
@@ -253,7 +269,11 @@ foreground: make deploy
   off for 5 minutes, keeps the error (`S2C::NamerError`, sent before `Sessions` in the reply to `List` and pushed on change) and the
   switcher title shows `naming: error, see server.log` while `nt ls` prints it. `SessionInfo.pending` marks sessions in the running batch (a dim braille spinner `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, ASCII `|/-\`, after the topic, animated by the client at ~8 fps only while the switcher is open and a session is pending). When the resource guards skip a run, the server sends `S2C::NamerPaused(reason)` (`battery`, `low memory`, `memory pressure`) and the switcher title shows a dim `naming paused: <reason>`.
 - **Scheduling**: a session is *dirty* after OSC 133 `D` (or a prompt ending a command), a cwd change (OSC 7), an `ssh` command line,
-  or >= 1 KiB new transcript (`Session::dirty`, cleared when a job is built). Background: a batch when some dirty session has had no output for 20 s,
+  or >= 1 KiB new transcript (`Session::dirty`, cleared when a job is built). **Opening the switcher refreshes every session with activity since its summary** (a command started or ended, including Ctrl-C'd ones, whose OSC 133 `D` carries
+  the exit 130; cwd, branch or group change; or >= 256 B of new output, instead of 1 KiB), current session first, at once and without the per-session failure
+  backoff; sessions that do not fit in the batch of 4 are shown pending too and follow in the next batch. If the resource guards postpone it, it is retried on
+  every tick while the switcher stays open. Staleness is exact, not timed: a summary made while command N ran covers N-1; it is stale when a later command exists or N has ended.
+  Background: a batch when some dirty session has had no output for 20 s,
   at most one batch per 2 min (measured from the last start). `Watch(true)` wakes the loop: a batch starts at once for dirty sessions with no cooldown (the resource guards still apply). If a batch is
   already running, or more sessions are due than fit in one batch (4), the loop runs a follow-up batch right after it ends while a client still watches.
   Job order in a watched batch: the watching client's current session first, then by last use (the switcher's order); results are applied and pushed per session as the child prints them. Pure rules: `namer::batch_allowed`, `session_ready`.

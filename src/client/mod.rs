@@ -1133,6 +1133,9 @@ mod tests {
             cpu_pct: 0.0,
             rss_bytes: 0,
             pending: false,
+            branch: String::new(),
+            summary_unix: 0,
+            summary_stale: false,
             group: None,
         };
         h.c.sessions = vec![info(1, "/srv/app"), info(2, "/var/log")];
@@ -1313,6 +1316,9 @@ mod tests {
             cpu_pct: 0.0,
             rss_bytes: 0,
             pending: false,
+            branch: String::new(),
+            summary_unix: 0,
+            summary_stale: false,
             group: None,
         };
         let line = ls_entry(&s, 100);
@@ -1345,6 +1351,9 @@ mod tests {
             cpu_pct: 0.0,
             rss_bytes: 0,
             pending: false,
+            branch: String::new(),
+            summary_unix: 0,
+            summary_stale: false,
             group,
         };
         let web = g("/h/web", "web", "~/web");

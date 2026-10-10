@@ -16,7 +16,7 @@ mod shell;
 mod transcript;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -45,11 +45,15 @@ const OUTBOX_LIMIT: usize = 2 << 20;
 const REG_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 /// New transcript bytes needed before a session gets a new recap.
 const NAMER_MIN_NEW: u64 = 1024;
+/// Opening the switcher refreshes a summary after this much new output (a Ctrl-C'd build prints much less than 1 KiB).
+const NAMER_MIN_NEW_OPEN: u64 = 256;
 /// After a failed job (or batch) the session (or everything) is left alone for this long.
 const NAMER_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const NAMER_MAX_JOBS: usize = 4;
 const STATUS_MIN_GAP: Duration = Duration::from_secs(1);
 const RES_WATCHED: Duration = Duration::from_secs(2);
+/// Delay of the first CPU figure after a switcher opens.
+const FIRST_CPU: Duration = Duration::from_millis(700);
 const RES_IDLE: Duration = Duration::from_secs(30);
 const STATUS_TICK: Duration = Duration::from_millis(250);
 const TRANSCRIPT_FLUSH: Duration = Duration::from_secs(3);
@@ -89,7 +93,13 @@ impl Outbox {
             return;
         }
         self.bytes.set(self.bytes.get() + n);
-        self.q.borrow_mut().push_back(m);
+        let mut q = self.q.borrow_mut();
+        if matches!(m, S2C::Sessions(_)) {
+            // A newer list supersedes an unsent one: a slow link must not queue up stale CPU numbers.
+            q.retain(|m| !matches!(m, S2C::Sessions(_)));
+        }
+        q.push_back(m);
+        drop(q);
         self.notify.notify_one();
     }
 
@@ -122,6 +132,16 @@ struct Registration {
     active: Option<u64>,
 }
 
+/// What a running naming job was built from: transcript position, context, commands covered, unix time, branch.
+struct Inflight {
+    mark: u64,
+    ctx: String,
+    seq: u64,
+    asof: u64,
+    running: bool,
+    branch: String,
+}
+
 struct State {
     cfg: Config,
     sessions: BTreeMap<SessionId, Session>,
@@ -140,13 +160,17 @@ struct State {
     /// A switcher opened while a batch was running (or more sessions were due than one batch holds):
     /// run another one as soon as this one ends.
     namer_again: bool,
+    /// The resource guards held back a run for an open switcher: try again on the next tick while it stays open.
+    gated_open: bool,
     namer_backoff: Option<Instant>,
     /// The last naming failure, shown in the switcher and `nt ls` (empty = none).
     naming_error: String,
     /// Why runs are postponed right now (low memory, battery); logged once per episode.
     gate_msg: Option<String>,
     /// Sessions in the running batch: transcript mark and context at job creation.
-    inflight: HashMap<SessionId, (u64, String, u64)>,
+    inflight: HashMap<SessionId, Inflight>,
+    /// Sessions due for a summary that did not fit in the running batch (shown as pending too).
+    queued: HashSet<SessionId>,
     /// Group keys as last seen on the naming tick, to push a change (cwd moves) to the clients.
     seen_groups: Vec<(SessionId, Option<String>)>,
     sampler: resources::Sampler,
@@ -209,7 +233,7 @@ impl State {
             .values()
             .map(|s| {
                 let mut i = s.info(self.attached(s.id).count() as u32);
-                i.pending = self.inflight.contains_key(&s.id);
+                i.pending = self.inflight.contains_key(&s.id) || self.queued.contains(&s.id);
                 i
             })
             .collect();
@@ -227,7 +251,17 @@ impl State {
             v.sort();
             v
         };
-        std::mem::replace(&mut self.seen_groups, now.clone()) != now
+        let old = std::mem::replace(&mut self.seen_groups, now.clone());
+        // A session that moved to another group (or into one) is doing something else now: summarize it again.
+        for (id, key) in &now {
+            if old.iter().any(|(i, _)| i == id) && !old.contains(&(*id, key.clone()))
+                && let Some(s) = self.sessions.get_mut(id)
+            {
+                s.dirty = true;
+                s.ctx_dirty = true;
+            }
+        }
+        old != now
     }
 
     fn broadcast_paused(&self) {
@@ -265,13 +299,37 @@ impl State {
             return false;
         }
         self.sampled_at = Some(now);
+        self.apply_sample(now, false);
+        // The branch is re-read while the switcher is open (a `git checkout` in another terminal).
+        if watched {
+            for s in self.sessions.values_mut() {
+                s.note_cwd();
+            }
+        }
+        watched
+    }
+
+    /// Take a /proc sample and store it per session. `no_cpu`: the window is too long for a meaningful CPU figure.
+    fn apply_sample(&mut self, now: Instant, no_cpu: bool) {
         let m = self.sampler.sample(now);
         for s in self.sessions.values_mut() {
             let (cpu, rss) = if s.exited { (0.0, 0) } else { m.get(&s.child.id()).copied().unwrap_or((0.0, 0)) };
-            s.cpu_pct = cpu;
+            s.cpu_pct = if no_cpu { 0.0 } else { cpu };
             s.rss_bytes = rss;
         }
-        watched
+    }
+
+    /// A switcher was opened: refresh what the idle 30 s sampling left stale. The memory and the branches are read at once;
+    /// the CPU baseline is taken now and the first real figure follows after `FIRST_CPU` instead of a 2 s wait.
+    fn on_watch(&mut self) {
+        for s in self.sessions.values_mut() {
+            s.note_cwd();
+        }
+        let now = Instant::now();
+        if self.sampled_at.is_none_or(|t| now.duration_since(t) >= RES_WATCHED) {
+            self.apply_sample(now, true);
+            self.sampled_at = Some(now.checked_sub(RES_WATCHED - FIRST_CPU).unwrap_or(now));
+        }
     }
 
     /// Statuses that changed since they were last pushed, at most once a second per session.
@@ -297,7 +355,7 @@ impl State {
         let now = now_unix();
         let mut changed = false;
         for s in self.sessions.values_mut() {
-            s.note_cwd();
+            changed |= s.note_cwd();
             let recent = now.saturating_sub(s.last_active) <= naming::RECENT_SECS;
             if !recent || s.exited {
                 continue;
@@ -334,16 +392,21 @@ impl State {
         let mut cands: Vec<(namer::Cand, naming::Probe)> = Vec::new();
         for s in self.sessions.values() {
             let new = s.tw.written().saturating_sub(s.recap_mark);
-            if new == 0 || (!eager && s.backoff_until > unix) || s.exited {
+            // A branch/group change is news by itself; otherwise there must be new output. The per-session backoff after a
+            // failed run does not hold back a switcher that was just opened.
+            if (new == 0 && !s.ctx_dirty) || (!eager && !force && s.backoff_until > unix) || s.exited {
                 continue;
             }
             // A rolling update needs something new to say.
-            if s.log.integrated && !s.summary.is_empty() && !s.log.has_news(s.summary_seq) {
+            if s.log.integrated && !s.summary.is_empty() && !s.ctx_dirty && !s.log.has_news(s.summary_seq) {
                 continue;
             }
             let Some(p) = naming::probe(s.master.as_ref().get_ref(), s.child.id()) else { continue };
-            let ctx_changed = s.recap_ctx.as_deref().is_some_and(|c| c != p.ctx);
-            let dirty = s.dirty || new >= NAMER_MIN_NEW || ctx_changed;
+            let ctx_changed = s.recap_ctx.as_deref().is_some_and(|c| c != p.ctx) || s.ctx_dirty;
+            // Opening the switcher refreshes every session with any activity since its summary.
+            let min_new = if force { NAMER_MIN_NEW_OPEN } else { NAMER_MIN_NEW };
+            let stale = force && !s.summary.is_empty() && s.summary_stale();
+            let dirty = s.dirty || new >= min_new || ctx_changed || stale;
             let quiet = Duration::from_secs(unix.saturating_sub(s.last_active));
             if eager || namer::session_ready(dirty, quiet, force) {
                 cands.push((namer::Cand { sid: s.id, new, last_used: s.last_used }, p));
@@ -352,12 +415,14 @@ impl State {
         if cands.is_empty() {
             self.gate_msg = None;
         } else if self.cfg.llm == config::LlmMode::Local {
+            self.gated_open = false;
             match guard::check_system(&self.cfg.llm_model, self.cfg.llm_on_battery) {
                 Err(why) => {
                     if self.gate_msg.is_none() {
                         eprintln!("nt: naming postponed: {why}");
                     }
                     self.gate_msg = Some(why);
+                    self.gated_open = force || (self.gated_open && self.clients.values().any(|c| c.watching));
                     return Vec::new();
                 }
                 Ok(()) => self.gate_msg = None,
@@ -371,6 +436,9 @@ impl State {
         cands.sort_by_key(|c| rank(c.0.sid));
         if cands.len() > NAMER_MAX_JOBS && force {
             self.namer_again = true;
+            self.queued = cands[NAMER_MAX_JOBS..].iter().map(|c| c.0.sid).collect();
+        } else {
+            self.queued.clear();
         }
         cands.truncate(NAMER_MAX_JOBS);
         let mut jobs = Vec::new();
@@ -379,9 +447,16 @@ impl State {
         for (c, p) in cands {
             let (new, sid) = (c.new, c.sid);
             let s = self.sessions.get_mut(&sid).unwrap();
-            let header = shell::header(&p.cwd, &home);
+            let mut header = shell::header(&p.cwd, &home);
+            let branch = shell::branch_of(&p.cwd).unwrap_or_default();
+            if !s.summary.is_empty() && s.summary_branch != branch {
+                // The topic describes what is going on NOW, so say what changed.
+                let (a, b) = (if s.summary_branch.is_empty() { "(none)" } else { &s.summary_branch }, if branch.is_empty() { "(none)" } else { &branch });
+                header.push_str(&format!("\nbranch changed since the earlier summary: {a} -> {b}"));
+            }
             let fg = p.cmd.clone().unwrap_or_default();
-            let prev = (!s.summary.is_empty()).then(|| s.summary.clone());
+            // Live-state phrases of an older summary ("currently building") must not be carried forward.
+            let prev = (!s.summary.is_empty()).then(|| namer::drop_live_state(&s.summary, false).unwrap_or_else(|| s.summary.clone()));
             let text = if s.log.integrated {
                 let fg = s.log.running_cmd().map_or(fg, |c| c.cmd.clone());
                 s.log.digest(&header, &fg, &home, unix, prev.as_deref().map(|p| (p, s.summary_seq)))
@@ -391,7 +466,8 @@ impl State {
             // The model never sees the home directory, the login name or the host name.
             let text = ident.scrub(&text);
             s.dirty = false;
-            self.inflight.insert(sid, (s.tw.written(), p.ctx.clone(), s.log.covered_seq()));
+            s.ctx_dirty = false;
+            self.inflight.insert(sid, Inflight { mark: s.tw.written(), ctx: p.ctx.clone(), seq: s.log.covered_seq(), asof: unix, running: s.log.is_running(), branch });
             jobs.push(namer::Job { sid, text });
         }
         if !jobs.is_empty() {
@@ -404,7 +480,7 @@ impl State {
     /// Apply one result of the running batch (`None`: the batch ended without a result for `sid`).
     /// Returns true if anything visible changed.
     fn apply_one(&mut self, sid: SessionId, out: Option<&namer::Out>) -> bool {
-        let Some((mark, ctx, seq)) = self.inflight.remove(&sid) else { return false };
+        let Some(Inflight { mark, ctx, seq, asof, running: was_running, branch }) = self.inflight.remove(&sid) else { return false };
         let Some(s) = self.sessions.get_mut(&sid) else { return false };
         let mut changed = true; // at least the pending marker goes away
         if out.is_some_and(|o| o.recap.is_some() || o.summary.is_some()) {
@@ -412,9 +488,14 @@ impl State {
             if let Some(r) = out.and_then(|o| o.recap.as_ref()) {
                 s.recap = r.clone();
             }
-            if let Some(sm) = out.and_then(|o| o.summary.as_ref()) {
-                s.summary = sm.clone();
+            // The status line shows live state; a summary that claims a finished command is still going is dropped.
+            let running = s.log.is_running() || s.status().0.starts_with(['⏵', '✎']);
+            if let Some(sm) = out.and_then(|o| o.summary.as_ref()).and_then(|sm| namer::drop_live_state(sm, running)) {
+                s.summary = sm;
                 s.summary_seq = seq;
+                s.summary_asof = asof;
+                s.summary_running = was_running;
+                s.summary_branch = branch;
             }
             s.recap_mark = mark;
             s.recap_ctx = Some(ctx.clone());
@@ -674,10 +755,12 @@ async fn serve(cfg: Config, sock: &Path) -> Result<()> {
         namer_ended: None,
         namer_kick: Rc::new(Notify::new()),
         namer_again: false,
+        gated_open: false,
         namer_backoff: None,
         naming_error: String::new(),
         gate_msg: None,
         inflight: HashMap::new(),
+        queued: HashSet::new(),
         seen_groups: Vec::new(),
         sampler: resources::Sampler::default(),
         sampled_at: None,
@@ -722,9 +805,13 @@ async fn naming_loop(st: Shared) {
     let mut tick = tokio::time::interval(if namer_now() { Duration::from_secs(1) } else { naming::INTERVAL });
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let mut force = false;
+        let force: bool;
         tokio::select! {
-            _ = tick.tick() => {}
+            _ = tick.tick() => {
+                // A refresh the guards postponed for an open switcher is retried at once instead of waiting for quiet time.
+                let s = st.borrow();
+                force = s.gated_open && s.clients.values().any(|c| c.watching);
+            }
             _ = kick.notified() => force = true,
             Some(m) = results.recv() => {
                 let mut s = st.borrow_mut();
@@ -951,7 +1038,11 @@ async fn client_loop(rd: &mut FrameReader, st: &Shared, cid: u64) -> Result<()> 
                     c.watching = w;
                 }
                 if w {
+                    s.on_watch();
+                    s.broadcast_sessions();
                     s.namer_kick.notify_one();
+                } else if !s.queued.is_empty() && !s.clients.values().any(|c| c.watching) {
+                    s.queued.clear();
                 }
             }
             C2S::Detach => {
@@ -1178,5 +1269,18 @@ mod tests {
         assert!(ob.overflow.get());
         // Control messages survive the drop; queued output does not outlive the overflow.
         assert!(matches!(ob.pop(), Some(S2C::Pong)));
+    }
+
+    #[test]
+    fn a_newer_session_list_replaces_an_unsent_one() {
+        let ob = Outbox::new();
+        let list = |n: usize| S2C::Sessions(Vec::with_capacity(n));
+        ob.push(list(1));
+        ob.push(S2C::Pong);
+        ob.push(list(2));
+        ob.push(list(3));
+        assert!(matches!(ob.pop(), Some(S2C::Pong)));
+        assert!(matches!(ob.pop(), Some(S2C::Sessions(_))));
+        assert!(ob.pop().is_none(), "only the newest list is kept");
     }
 }

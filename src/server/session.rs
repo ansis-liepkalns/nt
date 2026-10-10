@@ -116,6 +116,16 @@ pub struct Session {
     /// Latest resource sample.
     pub cpu_pct: f32,
     pub rss_bytes: u64,
+    /// Current git branch of the shell's directory (empty: not in a repository) and whether it was read at least once.
+    pub branch: String,
+    pub branch_seen: bool,
+    /// The branch or the group changed since the last namer job: re-summarize even without new commands.
+    pub ctx_dirty: bool,
+    /// Unix time the stored summary's job was built (0 = none) and the branch it saw.
+    pub summary_asof: u64,
+    /// A command was running when the summary was made (it is the one numbered `summary_seq + 1`).
+    pub summary_running: bool,
+    pub summary_branch: String,
 }
 
 fn winsize(cols: u16, rows: u16) -> Winsize {
@@ -218,6 +228,12 @@ impl Session {
             pushed_at: None,
             cpu_pct: 0.0,
             rss_bytes: 0,
+            branch: String::new(),
+            branch_seen: false,
+            ctx_dirty: false,
+            summary_asof: 0,
+            summary_running: false,
+            summary_branch: String::new(),
         };
         s.save_meta();
         Ok(s)
@@ -252,7 +268,10 @@ impl Session {
                 }
                 Item::Ev(e) => {
                     match &e {
-                        ShellEv::Done(_) => self.dirty = true,
+                        ShellEv::Done(_) => {
+                            self.dirty = true;
+                            self.note_cwd(); // `git checkout` etc. just ended
+                        }
                         ShellEv::Prompt if self.log.is_running() => self.dirty = true,
                         ShellEv::Cwd(p) if *p != self.log.cwd => self.dirty = true,
                         ShellEv::CmdLine(c) if super::namer::is_ssh(c) => self.dirty = true,
@@ -278,12 +297,28 @@ impl Session {
     }
 
     /// Update the remembered cwd from /proc (a no-op once the shell is gone).
-    pub fn note_cwd(&mut self) {
+    /// Also re-reads the git branch; a change marks the session for a new summary. Returns true if the branch changed.
+    pub fn note_cwd(&mut self) -> bool {
         if !self.exited
             && let Ok(p) = std::fs::read_link(format!("/proc/{}/cwd", self.child.id()))
         {
             self.last_cwd = p.display().to_string();
+            let b = shell::branch_of(&p).unwrap_or_default();
+            return self.set_branch(b);
         }
+        false
+    }
+
+    /// Record the branch seen now. The first reading is only remembered; a later change marks the session dirty.
+    pub fn set_branch(&mut self, b: String) -> bool {
+        let changed = self.branch_seen && b != self.branch;
+        self.branch_seen = true;
+        if changed {
+            self.dirty = true;
+            self.ctx_dirty = true;
+        }
+        self.branch = b;
+        changed
     }
 
     /// Start a new shell in the last cwd. Same id, screen, ring and transcript.
@@ -357,6 +392,11 @@ impl Session {
         let _ = killpg(Pid::from_raw(self.child.id() as i32), sig);
     }
 
+    /// Did anything happen since the summary was made (so it may describe a situation that is over)?
+    pub fn summary_stale(&self) -> bool {
+        !self.summary.is_empty() && (self.ctx_dirty || self.log.activity_since(self.summary_seq, self.summary_running))
+    }
+
     pub fn info(&self, clients: u32) -> SessionInfo {
         let (fg_cmd, cwd) = self.fg_and_cwd();
         let (status, status_since) = self.status();
@@ -381,6 +421,9 @@ impl Session {
             rss_bytes: self.rss_bytes,
             pending: false,
             group: None,
+            branch: self.branch.clone(),
+            summary_unix: if self.summary.is_empty() { 0 } else { self.summary_asof },
+            summary_stale: self.summary_stale(),
         }
     }
 }

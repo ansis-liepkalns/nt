@@ -561,6 +561,13 @@ impl CommandLog {
         self.running_cmd().map_or(self.total, |c| c.seq.saturating_sub(1))
     }
 
+    /// Did anything happen that a summary covering the first `seq` commands, made while a command was running
+    /// (`running`: the one numbered `seq + 1`), has not seen? A later command, or that running command being over.
+    pub fn activity_since(&self, seq: u64, running: bool) -> bool {
+        let seen = seq + u64::from(running);
+        self.entries.iter().any(|c| !c.cmd.is_empty() && (c.seq > seen || (running && c.seq == seen && c.end.is_some())))
+    }
+
     /// Whether `digest(.., prev)` would list anything new (a job without new activity is not worth a model call).
     pub fn has_news(&self, since: u64) -> bool {
         self.entries.iter().any(|c| !c.cmd.is_empty() && (c.seq > since || c.end.is_none()))
@@ -626,6 +633,11 @@ pub fn short_dur(s: u64) -> String {
     }
 }
 
+/// The git branch (or short commit id) of the repository containing `cwd`, if any. Handles worktrees (`.git` file).
+pub fn branch_of(cwd: &Path) -> Option<String> {
+    git_branch(&find_repo(cwd)?)
+}
+
 /// `cwd: ~/src/nt (git nt, branch reconnect)`
 pub fn header(cwd: &Path, home: &str) -> String {
     let shown = tilde(&cwd.display().to_string(), home);
@@ -641,7 +653,7 @@ pub fn header(cwd: &Path, home: &str) -> String {
     }
 }
 
-fn git_branch(repo: &Path) -> Option<String> {
+pub fn git_branch(repo: &Path) -> Option<String> {
     let dotgit = repo.join(".git");
     let gitdir = if dotgit.is_file() {
         let t = std::fs::read_to_string(&dotgit).ok()?;
@@ -763,6 +775,26 @@ mod tests {
         assert_eq!(plain.status(&st).0, "⏵ htop");
         let st = StatusIn { fg_cmd: "vim", fg_is_shell: false, alt: true, ..si() };
         assert_eq!(plain.status(&st).0, "✎ vim");
+    }
+
+    #[test]
+    fn summary_staleness_follows_commands() {
+        let mut log = CommandLog::default();
+        run(&mut log, "ls", 0, 1, 0, &["a"]);
+        // a summary made while `sleep 300` runs covers `ls` (seq 1) and saw the build running (seq 2)
+        log.apply(ShellEv::CmdLine("sleep 300".into()), 10);
+        log.apply(ShellEv::OutputStart, 10);
+        let (seq, running) = (log.covered_seq(), log.is_running());
+        assert_eq!((seq, running), (1, true));
+        assert!(!log.activity_since(seq, running), "the summary saw it running");
+        // Ctrl-C: the shell reports the end with 130
+        log.apply(ShellEv::Done(Some(130)), 20);
+        assert!(log.activity_since(seq, running));
+        // a summary made now covers it; nothing newer
+        let (seq, running) = (log.covered_seq(), log.is_running());
+        assert!(!log.activity_since(seq, running));
+        run(&mut log, "make", 30, 31, 0, &["ok"]);
+        assert!(log.activity_since(seq, running));
     }
 
     #[test]

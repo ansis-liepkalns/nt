@@ -6,7 +6,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTO_VERSION: u32 = 6;
+pub const PROTO_VERSION: u32 = 7;
 pub const MAX_FRAME: usize = 1 << 20;
 
 pub type SessionId = u32;
@@ -65,6 +65,12 @@ pub struct SessionInfo {
     pub pending: bool,
     /// The folder-tree group of the session's current directory; `None` = ungrouped.
     pub group: Option<GroupInfo>,
+    /// Current git branch of the shell's directory (read from `.git/HEAD`, no LLM); empty outside a repository.
+    pub branch: String,
+    /// Unix time the summary was made from (when its naming job was built); 0 = no summary.
+    pub summary_unix: u64,
+    /// Something happened since the summary was made (a command ended, the branch or directory changed, new output).
+    pub summary_stale: bool,
 }
 
 /// Compact elapsed time: `45s`, `3m12s`, `1h05m`.

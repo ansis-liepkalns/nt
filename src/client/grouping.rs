@@ -128,6 +128,9 @@ mod tests {
             cpu_pct: 0.0,
             rss_bytes: 0,
             pending: false,
+            branch: String::new(),
+            summary_unix: 0,
+            summary_stale: false,
             group: g.cloned(),
         }
     }
