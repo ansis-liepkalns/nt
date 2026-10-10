@@ -6,7 +6,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTO_VERSION: u32 = 5;
+pub const PROTO_VERSION: u32 = 6;
 pub const MAX_FRAME: usize = 1 << 20;
 
 pub type SessionId = u32;
@@ -18,6 +18,18 @@ pub enum NameSource {
     Llm,
     /// Locked: never auto-renamed.
     User,
+}
+
+/// The folder-tree group a session belongs to (see `server/groups.rs`): a project root, or the shallowest of several
+/// nested working directories.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct GroupInfo {
+    /// Absolute path of the group's root directory.
+    pub key: String,
+    /// Basename of `key` (the whole path when it is outside the server's $HOME).
+    pub label: String,
+    /// `key` with the server's $HOME shown as `~` (the client does not know the server's home).
+    pub shown: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -51,6 +63,8 @@ pub struct SessionInfo {
     pub rss_bytes: u64,
     /// A naming run that will update the topic and summary is in progress for this session.
     pub pending: bool,
+    /// The folder-tree group of the session's current directory; `None` = ungrouped.
+    pub group: Option<GroupInfo>,
 }
 
 /// Compact elapsed time: `45s`, `3m12s`, `1h05m`.

@@ -18,7 +18,7 @@ crossterm = "0.29.0"
 getrandom = "0.4.3"
 lexopt = "0.3.2"
 llama-cpp-2 = { version = "0.1.159", default-features = false, features = ["static-stdcxx"], optional = true }
-nix = { version = "0.31.3", features = ["term", "process", "fs", "signal", "user", "socket", "net"] }
+nix = { version = "0.31.3", features = ["term", "process", "fs", "signal", "user", "socket", "net", "hostname"] }
 postcard = { version = "1.1.3", features = ["alloc"] }
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.53.2", features = ["rt", "net", "io-util", "sync", "time", "macros", "signal"] }

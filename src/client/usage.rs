@@ -14,10 +14,11 @@ pub struct Scale {
 }
 
 impl Scale {
-    pub fn of(list: &[SessionInfo]) -> Scale {
+    /// The scale for `list` and some extra `(cpu, rss)` values it must cover (the sums shown on group headers).
+    pub fn of_with(list: &[SessionInfo], extra: &[(f32, u64)]) -> Scale {
         Scale {
-            cpu: list.iter().map(|s| s.cpu_pct).fold(MIN_CPU, f32::max),
-            rss: list.iter().map(|s| s.rss_bytes).fold(MIN_RSS, u64::max),
+            cpu: list.iter().map(|s| s.cpu_pct).chain(extra.iter().map(|e| e.0)).fold(MIN_CPU, f32::max),
+            rss: list.iter().map(|s| s.rss_bytes).chain(extra.iter().map(|e| e.1)).fold(MIN_RSS, u64::max),
         }
     }
 

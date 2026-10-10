@@ -1,6 +1,7 @@
 //! Terminal client: raw passthrough with a prefix key, the switcher overlay, and a local vt100 mirror
 //! so the screen can be repainted after an overlay closes without asking the server.
 
+mod grouping;
 mod help;
 pub mod remote;
 pub mod switcher;
@@ -198,6 +199,29 @@ fn ls_entry(s: &SessionInfo, now: u64) -> String {
     format!("#{:<3} {:<24} {:<32} {}", s.id, s.name, status, s.recap).trim_end().to_string()
 }
 
+/// The lines of `nt ls`: each folder-tree group as a header line with its sessions indented under it, then the
+/// ungrouped sessions in the plain one-line format.
+fn ls_lines(sessions: &[SessionInfo], now: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in grouping::blocks(sessions) {
+        let indent = if let Some(g) = b.group {
+            out.push(grouping::header_text(g, &b.members));
+            "  "
+        } else {
+            ""
+        };
+        for s in b.members {
+            let mut shown = s.clone();
+            shown.name = grouping::display_name(s, b.group);
+            if !shown.status.is_empty() {
+                shown.status = grouping::member_status(&shown.status, s, b.group);
+            }
+            out.push(format!("{indent}{}", ls_entry(&shown, now)));
+        }
+    }
+    out
+}
+
 /// Cut `line` to `width` columns with a trailing `…` (the topic goes first, then the status); no limit = unchanged.
 fn fit_line(line: &str, width: Option<usize>) -> String {
     match width {
@@ -233,8 +257,8 @@ pub fn ls(dest: Option<&str>, ssh_args: &[String]) -> Result<()> {
     let now = now_unix();
     // On a terminal every session fits on one line; piped output keeps the full text.
     let width = std::io::IsTerminal::is_terminal(&std::io::stdout()).then(|| size().map(|(c, _)| c as usize).ok()).flatten();
-    for s in &sessions {
-        println!("{}", fit_line(&ls_entry(s, now), width));
+    for line in ls_lines(&sessions, now) {
+        println!("{}", fit_line(&line, width));
     }
     if !naming_error.is_empty() {
         println!("naming: error: {naming_error}");
@@ -1109,6 +1133,7 @@ mod tests {
             cpu_pct: 0.0,
             rss_bytes: 0,
             pending: false,
+            group: None,
         };
         h.c.sessions = vec![info(1, "/srv/app"), info(2, "/var/log")];
         h.c.cur = Some(2);
@@ -1288,12 +1313,53 @@ mod tests {
             cpu_pct: 0.0,
             rss_bytes: 0,
             pending: false,
+            group: None,
         };
         let line = ls_entry(&s, 100);
         assert!(!line.contains('\n') && line.starts_with("#3") && line.contains("nt-reconnect"), "{line}");
         assert!(line.contains("⏵ make deploy · 1m40s") && line.ends_with("nt reconnect logic") && !line.contains("Long summary"), "{line}");
         let line = ls_entry(&SessionInfo { exited: true, recap: String::new(), ..s }, 100);
         assert!(line.ends_with("exited"), "{line}");
+    }
+
+    #[test]
+    fn ls_groups_sessions_under_a_header() {
+        let g = |key: &str, label: &str, shown: &str| crate::proto::GroupInfo { key: key.into(), label: label.into(), shown: shown.into() };
+        let mk = |id, name: &str, used, status: &str, group: Option<crate::proto::GroupInfo>| SessionInfo {
+            id,
+            name: name.into(),
+            name_source: crate::proto::NameSource::Heuristic,
+            created_unix: 0,
+            last_active_unix: used,
+            last_used_unix: used,
+            clients: 0,
+            cols: 80,
+            rows: 24,
+            cwd: "/h/x".into(),
+            fg_cmd: "bash".into(),
+            recap: String::new(),
+            summary: String::new(),
+            exited: false,
+            status: status.into(),
+            status_since: 0,
+            cpu_pct: 0.0,
+            rss_bytes: 0,
+            pending: false,
+            group,
+        };
+        let web = g("/h/web", "web", "~/web");
+        let list = vec![
+            mk(1, "web:cargo-test", 10, "✗ cargo test", Some(web.clone())),
+            mk(2, "tmp", 99, "", None),
+            mk(3, "web", 20, "✓ ok · {ago}", Some(web)),
+        ];
+        let lines = ls_lines(&list, 100);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[0], "web  ~/web  ✗ ✓");
+        assert!(lines[1].starts_with("  #3 ") && lines[2].starts_with("  #1 "), "{lines:?}");
+        assert!(lines[2].contains("cargo-test") && !lines[2].contains("web:"), "{lines:?}");
+        // ungrouped sessions follow in the plain format
+        assert!(lines[3].starts_with("#2 ") && lines[3].contains("tmp"), "{lines:?}");
     }
 
     #[test]

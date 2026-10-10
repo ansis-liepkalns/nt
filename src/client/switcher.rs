@@ -2,8 +2,8 @@
 
 use std::time::{Duration, Instant};
 
-use super::usage;
-use crate::proto::{SearchHit, SessionId, SessionInfo};
+use super::{grouping, usage};
+use crate::proto::{GroupInfo, SearchHit, SessionId, SessionInfo};
 
 /// Rows of the summary area, and the least terminal height (rows) that shows it.
 const DETAIL_ROWS: usize = 3;
@@ -259,7 +259,9 @@ fn session_score(query: &str, s: &SessionInfo) -> Option<i32> {
 
 fn haystack(s: &SessionInfo) -> String {
     let status = s.status.replace("{dur}", "").replace("{ago}", "");
-    format!("#{} {} {} {} {} {}", s.id, s.name, if s.exited { "exited" } else { &s.fg_cmd }, s.cwd, status, s.recap)
+    // The group's label and path are part of the text, so a query naming a group matches all its members.
+    let group = s.group.as_ref().map_or(String::new(), |g| format!(" {} {}", g.label, g.shown));
+    format!("#{} {} {} {} {} {}{}", s.id, s.name, if s.exited { "exited" } else { &s.fg_cmd }, s.cwd, status, s.recap, group)
 }
 
 // ---------------------------------------------------------------- switcher
@@ -281,6 +283,50 @@ enum Sub {
     Browse,
     Rename(SessionId, LineEditor),
     ConfirmKill(SessionId),
+}
+
+/// What the arrows move over: sessions (across groups, skipping headers) or groups (ungrouped sessions count as their own).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Level {
+    Session,
+    Group,
+}
+
+/// A group as listed: its members (indices into `sessions`, in display order).
+struct GView {
+    info: GroupInfo,
+    members: Vec<usize>,
+}
+
+/// The list as displayed: groups, then the ungrouped sessions.
+struct Flat {
+    groups: Vec<GView>,
+    loose: Vec<usize>,
+}
+
+impl Flat {
+    /// Session indices in display order.
+    fn sessions(&self) -> Vec<usize> {
+        self.groups.iter().flat_map(|g| g.members.iter().copied()).chain(self.loose.iter().copied()).collect()
+    }
+
+    /// The group level's entries.
+    fn entries(&self) -> Vec<Entry> {
+        (0..self.groups.len()).map(Entry::Group).chain(self.loose.iter().map(|&i| Entry::Single(i))).collect()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Entry {
+    Group(usize),
+    Single(usize),
+}
+
+/// What the selection stands on, to find it again after the list changed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Anchor {
+    Session(SessionId),
+    Group(String),
 }
 
 /// Entry order.
@@ -318,6 +364,11 @@ pub struct Switcher {
     /// Entry order, fixed when the switcher opens (alt-tab style): the current session, then the others by most
     /// recent use, exited ones last. Live updates change contents, never positions; new sessions go to the end.
     order: Vec<SessionId>,
+    /// Group order, fixed like `order`: the current session's group, then by the most recent use of any member.
+    group_order: Vec<String>,
+    level: Level,
+    /// Selected entry at the group level.
+    gsel: usize,
     /// The client's prefix key as a Ctrl char (`C-]` -> `']'`), when it is not a letter (letters are line-editing keys).
     prefix: Option<char>,
     /// The previous key was the prefix (`C-] d` detaches) or `C-x` (`C-x C-c` detaches).
@@ -332,22 +383,43 @@ fn open_order(sessions: &[SessionInfo], current: Option<SessionId>) -> Vec<Sessi
     v.into_iter().map(|s| s.id).collect()
 }
 
+/// The group order a switcher opens with.
+fn open_group_order(sessions: &[SessionInfo], current: Option<SessionId>) -> Vec<String> {
+    let mut v: Vec<(String, u64, bool)> = Vec::new();
+    for s in sessions {
+        let Some(g) = &s.group else { continue };
+        let cur = Some(s.id) == current;
+        match v.iter_mut().find(|e| e.0 == g.key) {
+            Some(e) => {
+                e.1 = e.1.max(s.last_used_unix);
+                e.2 |= cur;
+            }
+            None => v.push((g.key.clone(), s.last_used_unix, cur)),
+        }
+    }
+    v.sort_by_key(|e| (!e.2, std::cmp::Reverse(e.1)));
+    v.into_iter().map(|e| e.0).collect()
+}
+
 impl Switcher {
     /// Preselects the first entry: the current session, or, without one, the most recently used.
     pub fn new(sessions: Vec<SessionInfo>, current: Option<SessionId>) -> Self {
         let order = open_order(&sessions, current);
         let pos = |id: SessionId| order.iter().position(|&o| o == id).unwrap_or(usize::MAX);
-        let sel = 0;
         let mut sessions = sessions;
         sessions.sort_by_key(|s| pos(s.id));
-        Switcher {
+        let group_order = open_group_order(&sessions, current);
+        let mut sw = Switcher {
+            group_order,
+            level: Level::Session,
+            gsel: 0,
             order,
             sort: Sort::Recent,
             ascii: usage::ascii_mode(),
             sessions,
             current,
             filter: LineEditor::default(),
-            sel,
+            sel: 0,
             top: 0,
             page: 5,
             sub: Sub::Browse,
@@ -362,7 +434,13 @@ impl Switcher {
             spin: 0,
             prefix: None,
             chord: None,
+        };
+        // The first of the opening order (the current session, else the most recently used one) is preselected
+        // wherever the grouping puts it.
+        if let Some(&first) = sw.order.first() {
+            sw.sel = sw.visible().iter().position(|&i| sw.sessions[i].id == first).unwrap_or(0);
         }
+        sw
     }
 
     /// Tell the switcher the client's prefix byte so that `<prefix> d` detaches here too.
@@ -403,12 +481,21 @@ impl Switcher {
     }
 
     fn count(&self) -> usize {
-        if self.search { self.hits.len() } else { self.visible().len() }
+        if self.search {
+            self.hits.len()
+        } else if self.level == Level::Group {
+            self.flat().entries().len()
+        } else {
+            self.visible().len()
+        }
     }
 
-    /// Indices into `sessions`, best match first (id order when there is no filter).
-    fn visible(&self) -> Vec<usize> {
+    /// The groups and ungrouped sessions that match the filter, in display order: groups first (the opening
+    /// order, or by the best member when filtering or sorting by load), members and ungrouped sessions by the
+    /// sort / best match with the opening order as the tiebreak.
+    fn flat(&self) -> Flat {
         let q = self.filter.text();
+        let filtering = !q.trim().is_empty();
         let mut v: Vec<(i32, usize)> = self
             .sessions
             .iter()
@@ -417,7 +504,7 @@ impl Switcher {
             .collect();
         // Position in the opening order: the recency tiebreak (new sessions come last).
         let rank = |i: usize| self.order.iter().position(|&o| o == self.sessions[i].id).unwrap_or(usize::MAX);
-        if !q.trim().is_empty() {
+        if filtering {
             v.sort_by_key(|&(sc, i)| (-sc, rank(i)));
         } else {
             match self.sort {
@@ -426,11 +513,94 @@ impl Switcher {
                 Sort::Ram => v.sort_by_key(|&(_, i)| (std::cmp::Reverse(self.sessions[i].rss_bytes), rank(i))),
             }
         }
-        v.into_iter().map(|(_, i)| i).collect()
+        let mut flat = Flat { groups: Vec::new(), loose: Vec::new() };
+        for (_, i) in v {
+            match &self.sessions[i].group {
+                Some(g) => match flat.groups.iter_mut().find(|x| x.info.key == g.key) {
+                    Some(x) => x.members.push(i),
+                    None => flat.groups.push(GView { info: g.clone(), members: vec![i] }),
+                },
+                None => flat.loose.push(i),
+            }
+        }
+        // `groups` is now ordered by the best member. Without a filter the opening order (or the load) rules instead.
+        if !filtering {
+            let grank = |g: &GView| self.group_order.iter().position(|k| *k == g.info.key).unwrap_or(usize::MAX);
+            let sum = |g: &GView, f: &dyn Fn(&SessionInfo) -> f64| g.members.iter().map(|&i| f(&self.sessions[i])).sum::<f64>();
+            match self.sort {
+                Sort::Recent => flat.groups.sort_by_key(grank),
+                Sort::Cpu => flat.groups.sort_by(|a, b| sum(b, &|s| s.cpu_pct as f64).total_cmp(&sum(a, &|s| s.cpu_pct as f64)).then(grank(a).cmp(&grank(b)))),
+                Sort::Ram => flat.groups.sort_by(|a, b| sum(b, &|s| s.rss_bytes as f64).total_cmp(&sum(a, &|s| s.rss_bytes as f64)).then(grank(a).cmp(&grank(b)))),
+            }
+        }
+        flat
     }
 
+    /// Indices into `sessions` in display order (groups with their members, then the ungrouped ones).
+    fn visible(&self) -> Vec<usize> {
+        self.flat().sessions()
+    }
+
+    /// The most recently used member of an entry (the first of equals).
+    fn mru(&self, f: &Flat, e: Entry) -> Option<usize> {
+        match e {
+            Entry::Single(i) => Some(i),
+            Entry::Group(g) => f.groups.get(g)?.members.iter().copied().fold(None, |best: Option<usize>, i| match best {
+                Some(b) if self.sessions[b].last_used_unix >= self.sessions[i].last_used_unix => Some(b),
+                _ => Some(i),
+            }),
+        }
+    }
+
+    /// The session the selection stands for: the selected session, at the group level the most recently used
+    /// member of the selected group.
+    fn target(&self) -> Option<SessionId> {
+        let f = self.flat();
+        let i = match self.level {
+            Level::Session => *f.sessions().get(self.sel)?,
+            Level::Group => self.mru(&f, *f.entries().get(self.gsel)?)?,
+        };
+        Some(self.sessions[i].id)
+    }
+
+    /// The selected session; none while a group header is selected (renaming or closing a whole group is not a thing).
     fn selected(&self) -> Option<&SessionInfo> {
-        self.visible().get(self.sel).map(|&i| &self.sessions[i])
+        let f = self.flat();
+        match self.level {
+            Level::Session => f.sessions().get(self.sel).map(|&i| &self.sessions[i]),
+            Level::Group => match f.entries().get(self.gsel) {
+                Some(Entry::Single(i)) => Some(&self.sessions[*i]),
+                _ => None,
+            },
+        }
+    }
+
+    fn anchor(&self) -> Option<Anchor> {
+        let f = self.flat();
+        match self.level {
+            Level::Session => f.sessions().get(self.sel).map(|&i| Anchor::Session(self.sessions[i].id)),
+            Level::Group => match f.entries().get(self.gsel)? {
+                Entry::Single(i) => Some(Anchor::Session(self.sessions[*i].id)),
+                Entry::Group(g) => Some(Anchor::Group(f.groups[*g].info.key.clone())),
+            },
+        }
+    }
+
+    /// Put the selection back on `a` (or keep the index, clamped, when it is gone).
+    fn reanchor(&mut self, a: Option<Anchor>) {
+        let f = self.flat();
+        let vis = f.sessions();
+        let entries = f.entries();
+        let found = a.and_then(|a| match (self.level, a) {
+            (Level::Session, Anchor::Session(id)) => vis.iter().position(|&i| self.sessions[i].id == id),
+            (Level::Group, Anchor::Session(id)) => entries.iter().position(|e| matches!(e, Entry::Single(i) if self.sessions[*i].id == id)),
+            (Level::Group, Anchor::Group(k)) => entries.iter().position(|e| matches!(e, Entry::Group(g) if f.groups[*g].info.key == k)),
+            _ => None,
+        });
+        match self.level {
+            Level::Session => self.sel = found.unwrap_or(self.sel).min(vis.len().saturating_sub(1)),
+            Level::Group => self.gsel = found.unwrap_or(self.gsel).min(entries.len().saturating_sub(1)),
+        }
     }
 
     /// Close the selected session: an exited one at once, a live one after y/n.
@@ -448,9 +618,14 @@ impl Switcher {
     /// Rows for the summary area under the list: `DETAIL_ROWS` when it is on, the terminal is tall enough, the
     /// list keeps room for its entries and some session has a summary; else 0.
     fn detail_rows(&self, bh: usize, lh: usize) -> usize {
-        let any = self.sessions.iter().any(|s| !s.summary.is_empty());
+        let any = self.has_detail();
         let need = self.visible().len().clamp(1, 8);
         if self.detail && !self.search && any && bh >= DETAIL_MIN_ROWS && lh >= need + DETAIL_ROWS { DETAIL_ROWS } else { 0 }
+    }
+
+    /// Is there anything for the area under the list: a summary, or (group level) topics of group members.
+    fn has_detail(&self) -> bool {
+        self.sessions.iter().any(|s| !s.summary.is_empty() || (s.group.is_some() && !s.recap.is_empty()))
     }
 
     pub fn set_naming_error(&mut self, e: &str) {
@@ -477,7 +652,7 @@ impl Switcher {
         frames[self.spin % frames.len()]
     }
 
-    /// Replace the session list (server push), keeping the selection on the same session.
+    /// Replace the session list (server push), keeping the selection on the same session or group.
     pub fn update(&mut self, sessions: Vec<SessionInfo>, current: Option<SessionId>) {
         self.order.retain(|id| sessions.iter().any(|s| s.id == *id));
         for s in &sessions {
@@ -485,19 +660,22 @@ impl Switcher {
                 self.order.push(s.id);
             }
         }
+        // Groups keep their place; a group that appears while the switcher is open goes to the end of the groups.
+        self.group_order.retain(|k| sessions.iter().any(|s| s.group.as_ref().is_some_and(|g| g.key == *k)));
+        for g in sessions.iter().filter_map(|s| s.group.as_ref()) {
+            if !self.group_order.contains(&g.key) {
+                self.group_order.push(g.key.clone());
+            }
+        }
         if self.search {
             self.sessions = sessions;
             self.current = current;
             return;
         }
-        let id = self.selected().map(|s| s.id);
+        let anchor = self.anchor();
         self.sessions = sessions;
         self.current = current;
-        let vis = self.visible();
-        self.sel = id
-            .and_then(|id| vis.iter().position(|&i| self.sessions[i].id == id))
-            .unwrap_or(self.sel)
-            .min(vis.len().saturating_sub(1));
+        self.reanchor(anchor);
     }
 
     pub fn handle(&mut self, key: Key) -> Action {
@@ -552,12 +730,13 @@ impl Switcher {
                     if let Some(h) = self.hits.get(self.sel) {
                         return Action::Attach(h.session);
                     }
-                } else if let Some(s) = self.selected() {
-                    return Action::Attach(s.id);
+                } else if let Some(id) = self.target() {
+                    return Action::Attach(id);
                 }
             }
             Key::Ctrl('s') => {
                 self.search = !self.search;
+                self.level = Level::Session;
                 self.sel = 0;
                 self.top = 0;
                 self.hits.clear();
@@ -567,15 +746,15 @@ impl Switcher {
             }
             Key::AltEnter | Key::Ctrl('o') => return Action::New,
             Key::Alt('s') if !self.search => {
-                let id = self.selected().map(|s| s.id);
+                let anchor = self.anchor();
                 self.sort = match self.sort {
                     Sort::Recent => Sort::Cpu,
                     Sort::Cpu => Sort::Ram,
                     Sort::Ram => Sort::Recent,
                 };
-                if let Some(id) = id {
-                    self.sel = self.visible().iter().position(|&i| self.sessions[i].id == id).unwrap_or(0);
-                }
+                self.sel = 0;
+                self.gsel = 0;
+                self.reanchor(anchor);
                 self.top = 0;
             }
             Key::Alt('i') => self.detail = !self.detail,
@@ -589,14 +768,41 @@ impl Switcher {
             // would do nothing); anywhere else it is kill-line. In search mode it always edits the query.
             Key::Alt('k') => return self.kill_selected(),
             Key::Ctrl('k') if !self.search && self.filter.at_end() => return self.kill_selected(),
-            Key::Ctrl('n') | Key::Down => self.sel = (self.sel + 1).min(last),
-            Key::Ctrl('p') | Key::Up => self.sel = self.sel.saturating_sub(1),
-            Key::Ctrl('v') | Key::PageDown => self.sel = (self.sel + self.page).min(last),
-            Key::Alt('v') | Key::PageUp => self.sel = self.sel.saturating_sub(self.page),
-            Key::Alt('<') => self.sel = 0,
-            Key::Alt('>') => self.sel = last,
+            Key::Ctrl('n') | Key::Down => *self.cursor() = (*self.cursor() + 1).min(last),
+            Key::Ctrl('p') | Key::Up => *self.cursor() = self.cursor().saturating_sub(1),
+            Key::Ctrl('v') | Key::PageDown => *self.cursor() = (*self.cursor() + self.page).min(last),
+            Key::Alt('v') | Key::PageUp => *self.cursor() = self.cursor().saturating_sub(self.page),
+            Key::Alt('<') => *self.cursor() = 0,
+            Key::Alt('>') => *self.cursor() = last,
+            // ← goes up to the group level (the current selection's group, or the ungrouped session itself),
+            // → comes back down into the selected group's most recently used session. C-b / C-f move the filter cursor.
+            Key::Left | Key::Right if self.search => {}
+            Key::Left => {
+                if self.level == Level::Session {
+                    let f = self.flat();
+                    let vis = f.sessions();
+                    if let Some(&i) = vis.get(self.sel) {
+                        let at = f.entries().iter().position(|e| match *e {
+                            Entry::Single(j) => j == i,
+                            Entry::Group(g) => f.groups[g].members.contains(&i),
+                        });
+                        self.gsel = at.unwrap_or(0);
+                        self.level = Level::Group;
+                    }
+                }
+            }
+            Key::Right => {
+                if self.level == Level::Group {
+                    let f = self.flat();
+                    if let Some(i) = f.entries().get(self.gsel).and_then(|&e| self.mru(&f, e)) {
+                        self.sel = f.sessions().iter().position(|&j| j == i).unwrap_or(0);
+                        self.level = Level::Session;
+                    }
+                }
+            }
             k => {
                 if self.filter.handle(k) {
+                    self.level = Level::Session;
                     self.sel = 0;
                     self.top = 0;
                     if self.search {
@@ -606,6 +812,11 @@ impl Switcher {
             }
         }
         Action::None
+    }
+
+    /// The selection index the arrows move.
+    fn cursor(&mut self) -> &mut usize {
+        if self.level == Level::Group && !self.search { &mut self.gsel } else { &mut self.sel }
     }
 
     /// Escape sequences that draw the overlay on a `cols` x `rows` terminal.
@@ -619,12 +830,27 @@ impl Switcher {
         let lh = (ih.saturating_sub(2 + dh)).max(1);
         self.page = lh.saturating_sub(1).max(1);
 
-        let vis = if self.search { Vec::new() } else { self.visible() };
-        let count = self.count();
-        self.sel = self.sel.min(count.saturating_sub(1));
+        let flat = if self.search { Flat { groups: Vec::new(), loose: Vec::new() } } else { self.flat() };
+        let vis = flat.sessions();
+        let entries = flat.entries();
+        let count = if self.search {
+            self.hits.len()
+        } else if self.level == Level::Group {
+            entries.len()
+        } else {
+            vis.len()
+        };
+        if self.search {
+            self.sel = self.sel.min(count.saturating_sub(1));
+        } else {
+            self.sel = self.sel.min(vis.len().saturating_sub(1));
+            self.gsel = self.gsel.min(entries.len().saturating_sub(1));
+        }
 
-        // Row styles: 0 plain, 1 selected, 2 dim topic, 3 selected dim topic, 4 status, 5 selected status.
+        // Row styles: 0 plain, 1 selected, 2 dim topic, 3 selected dim topic, 4 status, 5 selected status,
+        // 6 group header (already styled), 7 selected group header, 8 / 9 status of a group member (9 selected).
         let mut lines: Vec<(String, u8)> = Vec::new();
+        let sel_entry = if self.level == Level::Group && !self.search { entries.get(self.gsel).copied() } else { None };
         if self.search {
             self.top = self.top.min(self.sel);
             if self.sel >= self.top + lh {
@@ -651,6 +877,17 @@ impl Switcher {
                 lines.push(line);
             }
         } else {
+            let pos_of = |i: usize| vis.iter().position(|&j| j == i).unwrap_or(0);
+            // The row whose extras (status, topic, load) are shown when space is short, and the selected group header.
+            let sel_row: Option<usize> = match (self.level, sel_entry) {
+                (Level::Session, _) => Some(self.sel),
+                (Level::Group, Some(Entry::Single(i))) => Some(pos_of(i)),
+                _ => None,
+            };
+            let sel_head = match sel_entry {
+                Some(Entry::Group(g)) => Some(g),
+                _ => None,
+            };
             let has_status = |pos: usize| {
                 let e = &self.sessions[vis[pos]];
                 !e.status.is_empty() && !e.exited
@@ -661,83 +898,157 @@ impl Switcher {
             };
             let (st, tp) = (|p: usize| has_status(p) as usize, |p: usize| has_topic(p) as usize);
             let lay = usage::layout(bw);
-            let scale = usage::Scale::of(&self.sessions);
+            let group_sums: Vec<(f32, u64)> = flat
+                .groups
+                .iter()
+                .map(|g| (g.members.iter().map(|&i| self.sessions[i].cpu_pct).sum(), g.members.iter().map(|&i| self.sessions[i].rss_bytes).sum()))
+                .collect();
+            let scale = usage::Scale::of_with(&self.sessions, &group_sums);
             let top_rss = self.sessions.iter().map(|s| s.rss_bytes).max().unwrap_or(0);
             // Narrow terminals have no room for numbers: the selected entry gets a detail line instead.
-            let dt = |p: usize| (lay == usage::Layout::Narrow && p == self.sel) as usize;
+            let dt = |p: usize| (lay == usage::Layout::Narrow && Some(p) == sel_row) as usize;
+            let heads = flat.groups.len();
             // Status and topic under every entry if they fit, else only the status, else only under the selected entry.
-            let tier = if (0..vis.len()).map(|p| 1 + st(p) + tp(p) + dt(p)).sum::<usize>() <= lh {
+            let tier = if (0..vis.len()).map(|p| 1 + st(p) + tp(p) + dt(p)).sum::<usize>() + heads <= lh {
                 2
-            } else if (0..vis.len()).map(|p| 1 + st(p) + dt(p)).sum::<usize>() <= lh {
+            } else if (0..vis.len()).map(|p| 1 + st(p) + dt(p)).sum::<usize>() + heads <= lh {
                 1
             } else {
                 0
             };
-            // One blank line between entries while everything (status and topic lines too) still fits.
-            let n = vis.len();
-            let gap = tier == 2 && n > 1 && (0..n).map(|p| 1 + st(p) + tp(p) + dt(p)).sum::<usize>() + n - 1 <= lh;
-            let sel = self.sel;
+            // Blocks: each group (header and members), then each ungrouped session. One blank line between blocks
+            // while everything (status and topic lines too) still fits; never between the members of a group.
+            let blocks = heads + flat.loose.len();
+            let full = (0..vis.len()).map(|p| 1 + st(p) + tp(p) + dt(p)).sum::<usize>() + heads;
+            let gap = tier == 2 && blocks > 1 && full + blocks - 1 <= lh;
             let height = |pos: usize| match tier {
                 2 => 1 + st(pos) + tp(pos) + dt(pos),
                 1 => 1 + st(pos) + dt(pos),
-                _ if pos == sel => (1 + st(pos) + tp(pos) + dt(pos)).min(lh),
+                _ if Some(pos) == sel_row => (1 + st(pos) + tp(pos) + dt(pos)).min(lh),
                 _ => 1,
             };
-            self.top = self.top.min(sel);
-            while self.top < sel && (self.top..=sel).map(height).sum::<usize>() > lh {
-                self.top += 1;
-            }
-            let name_w = vis
+            let group_of = |pos: usize| self.sessions[vis[pos]].group.as_ref();
+            let names: Vec<String> = (0..vis.len()).map(|p| grouping::display_name(&self.sessions[vis[p]], group_of(p))).collect();
+            let name_w = names
                 .iter()
-                .map(|&i| self.sessions[i].name.chars().count())
+                .map(|n| n.chars().count())
                 .max()
                 .unwrap_or(0)
                 .clamp(6, 24)
                 .min(iw.saturating_sub(12));
-            let mut pos = self.top;
-            while lines.len() < lh {
-                let Some(&i) = vis.get(pos) else {
-                    lines.push((fit("", iw), 0));
-                    continue;
-                };
-                let s = &self.sessions[i];
-                let selected = pos == sel;
+            let spinner = self.spinner();
+            // The lines of one session: its row, then the extras that fit.
+            let row_lines = |pos: usize| -> Vec<(String, u8)> {
+                let s = &self.sessions[vis[pos]];
+                let selected = Some(pos) == sel_row;
+                let g = group_of(pos);
+                let ind = if g.is_some() { "  " } else { "" };
                 let mark = if Some(s.id) == self.current { '*' } else { ' ' };
-                let head = format!(" {mark}#{:<3} {} [{}] {} ", s.id, fit(&s.name, name_w), s.clients, fit(if s.exited { "exited" } else { &s.fg_cmd }, 8));
+                let head = format!(" {ind}{mark}#{:<3} {} [{}] {} ", s.id, fit(&names[pos], name_w), s.clients, fit(if s.exited { "exited" } else { &s.fg_cmd }, 8));
                 let age = age(now, s.last_active_unix);
                 let (res, res_w) = usage::cell(s, &scale, s.rss_bytes == top_rss && top_rss > 0, lay, self.ascii);
                 let fixed = head.chars().count() + age.len() + 1;
                 // Drop the usage cell when even a short cwd would not fit next to it.
                 let show = iw >= fixed + res_w + 1 + if lay == usage::Layout::Narrow { 0 } else { 8 };
                 let w = if show { res_w + 1 } else { 0 };
-                let cwd = fit_left(&s.cwd, iw.saturating_sub(fixed + w));
+                let place = g.map_or_else(|| s.cwd.clone(), |g| grouping::subdir(s, g));
+                let cwd = fit_left(&place, iw.saturating_sub(fixed + w));
+                let mut out = Vec::new();
                 if show {
-                    lines.push((format!("{head}{cwd} {res} {age}"), selected as u8));
+                    out.push((format!("{head}{cwd} {res} {age}"), selected as u8));
                 } else {
-                    lines.push((fit(&format!("{head}{cwd} {age}"), iw), selected as u8));
+                    out.push((fit(&format!("{head}{cwd} {age}"), iw), selected as u8));
                 }
+                let pad = " ".repeat(7 + ind.len());
                 let mut extras: Vec<(String, u8)> = Vec::new();
                 if dt(pos) == 1 {
-                    extras.push((fit(&format!("       {}", usage::detail(s)), iw), 2 + selected as u8));
+                    extras.push((fit(&format!("{pad}{}", usage::detail(s)), iw), 2 + selected as u8));
                 }
                 if has_status(pos) {
-                    let text = crate::proto::expand_status(&s.status, s.status_since, now);
-                    extras.push((fit(&format!("       {text}"), iw), 4 + selected as u8));
+                    let text = grouping::member_status(&crate::proto::expand_status(&s.status, s.status_since, now), s, g);
+                    extras.push((fit(&format!("{pad}{text}"), iw), (if g.is_some() { 8 } else { 4 }) + selected as u8));
                 }
                 if has_topic(pos) {
-                    let t = if s.pending { format!("{} {}", s.recap, self.spinner()).trim().to_string() } else { s.recap.clone() };
-                    extras.push((fit(&format!("       {t}"), iw), 2 + selected as u8));
+                    let t = if s.pending { format!("{} {}", s.recap, spinner).trim().to_string() } else { s.recap.clone() };
+                    extras.push((fit(&format!("{pad}{t}"), iw), 2 + selected as u8));
                 }
                 // Tier 1 shows no topic: it is the last extra, and `height` leaves no room for it.
-                for e in extras.into_iter().take(height(pos) - 1) {
-                    if lines.len() < lh {
-                        lines.push(e);
-                    }
-                }
-                pos += 1;
-                if gap && pos < n && lines.len() < lh {
+                out.extend(extras.into_iter().take(height(pos) - 1));
+                out
+            };
+            // A group's header: bold label, dim path, status icons (worst first) and the summed load.
+            let head_line = |gi: usize, selected: bool| -> (String, u8) {
+                let g = &flat.groups[gi];
+                let members: Vec<&SessionInfo> = g.members.iter().map(|&i| &self.sessions[i]).collect();
+                let icons = grouping::icons(members.iter().copied());
+                let compact = bw <= 50;
+                let mut sum = members[0].clone();
+                (sum.cpu_pct, sum.rss_bytes) = group_sums[gi];
+                let (res, res_w) = usage::cell(&sum, &scale, false, if compact { usage::Layout::Narrow } else { lay }, self.ascii);
+                let icon_w = if icons.is_empty() { 0 } else { icons.len() * 2 - 1 };
+                let sep = if icons.is_empty() { "" } else if compact { " " } else { "  " };
+                let (reserve, right_w) = if iw < 20 { (0, 0) } else { (if compact { 1 } else { 3 }, icon_w + sep.len() + res_w) };
+                let right = if iw < 20 {
+                    String::new()
+                } else {
+                    let ic: Vec<String> = icons.iter().map(|c| format!("\x1b[{}m{c}\x1b[39m", grouping::icon_color(*c))).collect();
+                    format!("{}{sep}{res}{}", ic.join(" "), " ".repeat(reserve))
+                };
+                let avail = iw.saturating_sub(reserve + right_w);
+                let label: String = clean(&g.info.label).chars().take(avail.saturating_sub(2).max(1)).collect();
+                let label_w = label.chars().count();
+                let path_room = avail.saturating_sub(1 + label_w + 2);
+                let path = if !compact && g.info.shown != g.info.label && path_room >= 6 { fit_left(&g.info.shown, path_room).trim_end().to_string() } else { String::new() };
+                let path_part = if path.is_empty() { String::new() } else { format!("  \x1b[2m{path}\x1b[22m") };
+                let used = 1 + label_w + if path.is_empty() { 0 } else { 2 + path.chars().count() };
+                let t = format!(" \x1b[1m{label}\x1b[22m{path_part}{}{right}\x1b[0m", " ".repeat(avail.saturating_sub(used)));
+                (t, 6 + selected as u8)
+            };
+            let mut span = (0, 0);
+            let mut bi = 0;
+            let mut pos = 0;
+            for gi in 0..heads {
+                if gap && bi > 0 {
                     lines.push((fit("", iw), 0));
                 }
+                bi += 1;
+                let start = lines.len();
+                lines.push(head_line(gi, sel_head == Some(gi)));
+                if sel_head == Some(gi) {
+                    span = (start, start + 1);
+                }
+                for (k, _) in flat.groups[gi].members.iter().enumerate() {
+                    let from = lines.len();
+                    lines.extend(row_lines(pos));
+                    if Some(pos) == sel_row {
+                        // The first member of a group scrolls into view together with its header.
+                        span = (if k == 0 { start } else { from }, lines.len());
+                    }
+                    pos += 1;
+                }
+            }
+            for _ in 0..flat.loose.len() {
+                if gap && bi > 0 {
+                    lines.push((fit("", iw), 0));
+                }
+                bi += 1;
+                let from = lines.len();
+                lines.extend(row_lines(pos));
+                if Some(pos) == sel_row {
+                    span = (from, lines.len());
+                }
+                pos += 1;
+            }
+            // Scroll so that the selection is in view, then cut the window.
+            let total = lines.len();
+            self.top = self.top.min(span.0);
+            if span.1 > self.top + lh {
+                self.top = (span.1 - lh).min(span.0);
+            }
+            self.top = self.top.min(total.saturating_sub(lh));
+            lines = lines.into_iter().skip(self.top).take(lh).collect();
+            while lines.len() < lh {
+                lines.push((fit("", iw), 0));
             }
         }
 
@@ -745,8 +1056,27 @@ impl Switcher {
         let detail: Vec<String> = if dh == 0 {
             Vec::new()
         } else {
-            let text = vis.get(self.sel).map_or("", |&i| self.sessions[i].summary.as_str());
-            wrap(text, iw.saturating_sub(2), dh).into_iter().map(|l| fit(&format!(" {l}"), iw)).collect()
+            match sel_entry {
+                // A group: the topics of its members.
+                Some(Entry::Group(g)) => {
+                    let topics: Vec<String> = flat.groups[g]
+                        .members
+                        .iter()
+                        .map(|&i| &self.sessions[i])
+                        .filter(|s| !s.recap.is_empty())
+                        .map(|s| format!(" #{} {}", s.id, s.recap))
+                        .collect();
+                    let mut v: Vec<String> = topics.iter().take(dh).map(|t| fit(t, iw)).collect();
+                    if topics.len() > dh {
+                        v[dh - 1] = fit(&format!(" … and {} more topics", topics.len() - dh + 1), iw);
+                    }
+                    v
+                }
+                _ => {
+                    let text = self.selected().map_or("", |s| s.summary.as_str());
+                    wrap(text, iw.saturating_sub(2), dh).into_iter().map(|l| fit(&format!(" {l}"), iw)).collect()
+                }
+            }
         };
 
         // Prompt line, with the cursor position inside it.
@@ -782,34 +1112,40 @@ impl Switcher {
                     Sort::Ram => "M-s sort:ram".to_string(),
                 };
                 // M-i is only advertised where the summary area could be shown (tall enough, some summary exists).
-                let info = self.sessions.iter().any(|s| !s.summary.is_empty()) && bh >= DETAIL_MIN_ROWS;
+                let info = self.has_detail() && bh >= DETAIL_MIN_ROWS;
                 let i = if info { "M-i info  " } else { "" };
-                [
+                // The arrows are advertised where there are groups, and only if the hint still fits with them.
+                let grouped = self.sessions.iter().any(|s| s.group.is_some());
+                let ar = if self.ascii { "</>" } else { "←/→" };
+                let mut hints: Vec<String> = Vec::new();
+                for h in [
                     format!("RET attach  C-s search  C-o new  M-r rename  C-k kill  {i}{so}  C-] d detach  C-g cancel"),
                     format!("RET attach  C-s search  C-o new  M-r rename  C-k kill  {i}{so}  C-g cancel"),
                     format!("RET go  C-s find  C-o new  M-r ren  C-k kill  {i}{so}  C-] d detach  C-g quit"),
                     format!("RET go  C-s find  C-o new  M-r ren  C-k kill  {i}{so}  C-g quit"),
                     format!("RET attach  C-s search  C-o new  M-r rename  C-k kill  {so}  C-g cancel"),
                     format!("RET go  C-s find  C-o new  M-r ren  C-k kill  {so}  C-g quit"),
-                    format!("RET C-s C-o M-r C-k {so}  C-g"),
-                    "RET C-s C-o M-r C-k M-s C-g".to_string(),
-                    "RET C-g".to_string(),
-                ]
-                .into_iter()
-                .find(|h| h.chars().count() <= iw)
-                .unwrap_or_default()
+                ] {
+                    if grouped {
+                        hints.push(h.replacen("  ", &format!("  {ar} groups  "), 1));
+                    }
+                    hints.push(h);
+                }
+                hints.extend([format!("RET C-s C-o M-r C-k {so}  C-g"), "RET C-s C-o M-r C-k M-s C-g".to_string(), "RET C-g".to_string()]);
+                hints.into_iter().find(|h| h.chars().count() <= iw).unwrap_or_default()
             }
         };
 
         let mut out = String::from("\x1b[?25l\x1b[0m");
         let mut put = |row: usize, text: &str| out.push_str(&format!("\x1b[{};{}H{}", by + row + 1, bx + 1, text));
         let total = usage::total(&self.sessions);
+        let nsess = if self.search { self.sessions.len() } else { vis.len() };
         let title = if self.search {
             format!("─ nt search ({} hits) ", count)
         } else if self.sessions.iter().any(|s| s.rss_bytes > 0) && total.chars().count() + 6 <= iw {
             format!("─ nt: {total} ")
         } else {
-            format!("─ nt sessions ({count}) ")
+            format!("─ nt sessions ({nsess}) ")
         };
         const NAMING_ERR: &str = " naming: error, see server.log ";
         let tl = title.chars().count();
@@ -842,15 +1178,21 @@ impl Switcher {
                             format!("{g}\x1b[1m{}\x1b[22m{}", &rest[..cut], &rest[cut..])
                         }
                         2 => format!("\x1b[2m{t}\x1b[0m"),
+                        6 => t.clone(),
+                        7 => {
+                            let (g, rest) = gutter(t);
+                            format!("{g}{rest}")
+                        }
                         3 => {
                             let (g, rest) = gutter(t);
                             format!("{g}{rest}")
                         }
-                        4 => status_row(t, false),
-                        _ => {
+                        4 => status_row(t, false, 7),
+                        8 => status_row(t, false, 9),
+                        n => {
                             // The body starts with the plain blank of the gutter column: swap it for the marker.
                             let (g, _) = gutter(t);
-                            format!("{g}{}", status_row(t, true).chars().skip(1).collect::<String>())
+                            format!("{g}{}", status_row(t, true, if *n == 9 { 9 } else { 7 }).chars().skip(1).collect::<String>())
                         }
                     }
                 }
@@ -868,10 +1210,10 @@ impl Switcher {
 
 // ---------------------------------------------------------------- text helpers
 
-/// A status row (6 columns of indent, then the status): the leading symbol is coloured
+/// A status row (`indent` columns, then the status): the leading symbol is coloured
 /// (green check, red cross, yellow running/editing); other statuses are dim.
-fn status_row(t: &str, selected: bool) -> String {
-    let (pre, rest) = t.split_at(t.char_indices().nth(7).map_or(t.len(), |(i, _)| i));
+fn status_row(t: &str, selected: bool, indent: usize) -> String {
+    let (pre, rest) = t.split_at(t.char_indices().nth(indent).map_or(t.len(), |(i, _)| i));
     let mut it = rest.chars();
     let body = match it.next() {
         Some(c @ ('✓' | '✗' | '⏵' | '✎')) => {
@@ -1062,6 +1404,7 @@ mod tests {
             cpu_pct: 0.0,
             rss_bytes: 0,
             pending: false,
+            group: None,
         }
     }
 
@@ -1703,5 +2046,416 @@ mod tests {
         sw.set_hits(vec![SearchHit { session: 1, line: "summary: …the nt reconnect logic".into() }]);
         let out = sw.render(80, 24, 100);
         assert!(out.contains("calm-otter: summary: …the nt reconnect logic"));
+    }
+
+    // ------------------------------------------------------------ groups
+
+    fn grp(key: &str) -> GroupInfo {
+        let (label, shown) = match key.strip_prefix("/h/") {
+            Some(rel) => (rel.rsplit('/').next().unwrap_or(rel).to_string(), format!("~/{rel}")),
+            None => (key.to_string(), key.to_string()),
+        };
+        GroupInfo { key: key.into(), label, shown }
+    }
+
+    /// A session in group `key` (`""` = ungrouped), working in `cwd`.
+    fn gi(id: u32, name: &str, used: u64, key: &str, cwd: &str) -> SessionInfo {
+        let mut i = info(id, name, 0, used);
+        i.cwd = cwd.into();
+        i.group = (!key.is_empty()).then(|| grp(key));
+        i
+    }
+
+    /// Three groups and a loose session; ids chosen so that id order differs from every other order.
+    fn grouped() -> Vec<SessionInfo> {
+        vec![
+            gi(1, "a-one", 10, "/h/a", "/h/a"),
+            gi(2, "a-two", 50, "/h/a", "/h/a/sub"),
+            gi(3, "b-one", 30, "/h/b", "/h/b"),
+            gi(4, "c-one", 90, "/h/c", "/h/c"),
+            gi(5, "loose-one", 100, "", "/tmp"),
+            gi(6, "loose-two", 5, "", "/var"),
+        ]
+    }
+
+    #[test]
+    fn group_order_current_first_then_recent_use_then_ungrouped() {
+        // current = 3: its group first, then groups by most recent member (c 90, a 50), then ungrouped by recency
+        let sw = Switcher::new(grouped(), Some(3));
+        assert_eq!(ids(&sw), vec![3, 4, 2, 1, 5, 6]);
+        assert_eq!(sw.selected().unwrap().id, 3);
+        // current = 1: within the group the current session leads, the other group ordering is by recency
+        let sw = Switcher::new(grouped(), Some(1));
+        assert_eq!(ids(&sw), vec![1, 2, 4, 3, 5, 6]);
+        // no current session: groups by recency, the most recently used session of all is preselected even though
+        // it is ungrouped
+        let sw = Switcher::new(grouped(), None);
+        assert_eq!(ids(&sw), vec![4, 2, 1, 3, 5, 6]);
+        assert_eq!(sw.selected().unwrap().id, 5);
+    }
+
+    #[test]
+    fn group_order_is_stable_while_open() {
+        let mut sw = Switcher::new(grouped(), Some(3));
+        // session 1 becomes the most recent one anywhere, 7 joins group b, 8 starts group d, 9 is ungrouped; 6 leaves
+        let mut upd = grouped();
+        upd.retain(|s| s.id != 6);
+        upd[0].last_used_unix = 999;
+        upd.push(gi(7, "b-two", 1, "/h/b", "/h/b/x"));
+        upd.push(gi(8, "d-one", 2000, "/h/d", "/h/d"));
+        upd.push(gi(9, "loose-new", 3000, "", "/srv"));
+        sw.update(upd, Some(3));
+        // positions did not change; new sessions are appended to their group's end, a new group after the groups
+        assert_eq!(ids(&sw), vec![3, 7, 4, 2, 1, 8, 5, 9]);
+        // a session that moves to another group shows up there at once
+        let mut upd = grouped();
+        upd[0].group = Some(grp("/h/c"));
+        sw.update(upd, Some(3));
+        assert_eq!(ids(&sw), vec![3, 4, 1, 2, 5, 6]);
+        let g: Vec<_> = sw.flat().groups.iter().map(|g| g.info.key.clone()).collect();
+        assert_eq!(g, vec!["/h/b", "/h/c", "/h/a"]);
+        // the selection follows its session
+        let mut sw = Switcher::new(grouped(), Some(3));
+        sw.handle(Key::Down);
+        sw.handle(Key::Down); // on 2
+        assert_eq!(sw.selected().unwrap().id, 2);
+        let mut upd = grouped();
+        upd[1].last_used_unix = 1;
+        upd[3].last_used_unix = 5000;
+        sw.update(upd, Some(3));
+        assert_eq!(sw.selected().unwrap().id, 2);
+    }
+
+    fn sel_id(sw: &Switcher) -> u32 {
+        sw.selected().unwrap().id
+    }
+
+    #[test]
+    fn up_down_walk_the_sessions_across_groups() {
+        let mut sw = Switcher::new(grouped(), Some(3));
+        let mut seen = vec![sel_id(&sw)];
+        for _ in 0..8 {
+            sw.handle(Key::Down);
+            seen.push(sel_id(&sw));
+        }
+        // headers are skipped; the ends clamp
+        assert_eq!(seen, vec![3, 4, 2, 1, 5, 6, 6, 6, 6]);
+        for _ in 0..8 {
+            sw.handle(Key::Ctrl('p'));
+        }
+        assert_eq!(sel_id(&sw), 3);
+        sw.handle(Key::Ctrl('n'));
+        assert_eq!(sel_id(&sw), 4);
+        // → at the session level does nothing, and neither arrow touches the filter cursor
+        sw.handle(Key::Right);
+        assert_eq!((sel_id(&sw), sw.level), (4, Level::Session));
+        for c in "ab".chars() {
+            sw.handle(Key::Char(c));
+        }
+        sw.handle(Key::Left);
+        sw.handle(Key::Right);
+        sw.handle(Key::Char('c'));
+        assert_eq!(sw.filter.text(), "abc");
+        // C-b / C-f still move it
+        sw.handle(Key::Ctrl('b'));
+        sw.handle(Key::Char('X'));
+        assert_eq!(sw.filter.text(), "abXc");
+    }
+
+    #[test]
+    fn left_right_switch_between_session_and_group_level() {
+        let mut sw = Switcher::new(grouped(), Some(3));
+        sw.handle(Key::Down);
+        sw.handle(Key::Down); // session 2 in group a
+        // ← selects the group a
+        sw.handle(Key::Left);
+        assert_eq!(sw.level, Level::Group);
+        let f = sw.flat();
+        assert_eq!(sw.entries_of(&f), vec!["/h/b", "/h/c", "/h/a", "#5", "#6"]);
+        assert_eq!(sw.gsel, 2);
+        assert!(sw.selected().is_none(), "a header is not a session");
+        // ←  again does nothing, ↑/↓ move between groups and ungrouped entries
+        sw.handle(Key::Left);
+        assert_eq!(sw.gsel, 2);
+        sw.handle(Key::Down);
+        assert_eq!(sw.gsel, 3);
+        assert_eq!(sel_id(&sw), 5, "an ungrouped session is its own entry");
+        sw.handle(Key::Down);
+        sw.handle(Key::Down);
+        assert_eq!(sw.gsel, 4);
+        sw.handle(Key::Up);
+        sw.handle(Key::Up);
+        sw.handle(Key::Up);
+        assert_eq!(sw.gsel, 1);
+        // → enters the group, selecting its most recently used session; RET on a header does the same
+        assert_eq!(sw.handle(Key::Enter), Action::Attach(4));
+        sw.handle(Key::Up);
+        sw.handle(Key::Up);
+        assert_eq!(sw.gsel, 0);
+        assert_eq!(sw.handle(Key::Enter), Action::Attach(3));
+        sw.handle(Key::Down);
+        sw.handle(Key::Down);
+        assert_eq!(sw.gsel, 2);
+        assert_eq!(sw.handle(Key::Enter), Action::Attach(2), "a is entered at its most recent member (2), not the first listed");
+        sw.handle(Key::Right);
+        assert_eq!((sw.level, sel_id(&sw)), (Level::Session, 2));
+        // typing a filter goes back to the session level
+        sw.handle(Key::Left);
+        sw.handle(Key::Char('x'));
+        assert_eq!(sw.level, Level::Session);
+        // renaming and closing need a session
+        let mut sw = Switcher::new(grouped(), Some(3));
+        sw.handle(Key::Left);
+        assert_eq!(sw.handle(Key::Alt('k')), Action::None);
+        assert!(matches!(sw.sub, Sub::Browse));
+        sw.handle(Key::Alt('r'));
+        assert!(matches!(sw.sub, Sub::Browse));
+        // …but an ungrouped entry is a session
+        sw.handle(Key::Down);
+        sw.handle(Key::Down);
+        sw.handle(Key::Down);
+        assert_eq!(sel_id(&sw), 5);
+        sw.handle(Key::Alt('k'));
+        assert!(matches!(sw.sub, Sub::ConfirmKill(5)));
+    }
+
+    impl Switcher {
+        /// Test aid: the group-level entries as group keys / `#id`.
+        fn entries_of(&self, f: &Flat) -> Vec<String> {
+            f.entries()
+                .iter()
+                .map(|e| match *e {
+                    Entry::Group(g) => f.groups[g].info.key.clone(),
+                    Entry::Single(i) => format!("#{}", self.sessions[i].id),
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn selection_survives_updates_at_the_group_level() {
+        let mut sw = Switcher::new(grouped(), Some(3));
+        sw.handle(Key::Left);
+        sw.handle(Key::Down); // group c
+        let mut upd = grouped();
+        upd.push(gi(7, "new", 1, "/h/z", "/h/z"));
+        upd[3].status = "✓ done".into();
+        sw.update(upd, Some(3));
+        assert_eq!((sw.level, sw.gsel), (Level::Group, 1));
+        // the group vanishes: the index is clamped
+        let upd: Vec<_> = grouped().into_iter().filter(|s| s.id != 4).collect();
+        sw.update(upd, Some(3));
+        assert!(sw.gsel < sw.count());
+    }
+
+    /// The text of every screen row of a render.
+    fn screen(sw: &mut Switcher, cols: u16, rows: u16) -> Vec<String> {
+        let out = sw.render(cols, rows, 100);
+        (1..=rows as usize).map(|r| text_at(&out, r)).collect()
+    }
+
+    #[test]
+    fn grouped_rendering_80x24() {
+        let mut list = grouped();
+        list[1].status = "✗ cargo test (101) · {ago}".into();
+        list[1].recap = "fixing the order tests".into();
+        list[0].status = "✓ cargo build · {ago}".into();
+        list[0].name_source = NameSource::Heuristic;
+        list[0].name = "a:cargo-build".into();
+        list[2].status = "⏵ make · {dur}".into();
+        list[3].cpu_pct = 30.0;
+        list[3].rss_bytes = 200 << 20;
+        let mut sw = Switcher::new(list, Some(3));
+        let scr = screen(&mut sw, 80, 24);
+        let at = |needle: &str| scr.iter().position(|l| l.contains(needle));
+        // the current session's group first, bold label and dim path on the header line, icons worst first
+        let hb = at("│ b").unwrap();
+        assert!(scr[hb].contains("~/b"), "{}", scr[hb]);
+        let ha = at("│ a  ").unwrap();
+        assert!(scr[ha].contains("~/a") && scr[ha].contains("✗ ✓"), "{}", scr[ha]);
+        assert!(scr.iter().all(|l| l.chars().count() == 80));
+        // members are indented by two more columns than ungrouped rows and show no cwd column but the subdir
+        let m2 = at("#2 ").unwrap();
+        assert!(scr[m2].contains("a-two") && scr[m2].contains("sub/") && !scr[m2].contains("/h/a"), "{}", scr[m2]);
+        let m1 = at("#1 ").unwrap();
+        assert!(scr[m1].contains("│   ") && !scr[m1].contains("/h/a"), "{}", scr[m1]);
+        // the redundant `a:` is dropped from the heuristic name
+        assert!(scr[m1].contains("cargo-build") && !scr[m1].contains("a:cargo"), "{}", scr[m1]);
+        // members of a group are adjacent, groups are separated by a blank line, and so is the ungrouped block
+        let (r2, r1) = (at("#2 ").unwrap(), at("#1 ").unwrap());
+        assert!(r1 > r2 && scr[hb + 1].contains("#3 "), "{scr:?}");
+        let loose = at("#5 ").unwrap();
+        assert!(scr[loose - 1].trim_matches('│').trim().is_empty(), "blank line before the ungrouped block: {}", scr[loose - 1]);
+        // no blank line between the header and its members
+        assert!(scr[ha + 1].contains("#2 "), "{}", scr[ha + 1]);
+        // the usage of group c is on its header
+        let hc = at("│ c ").unwrap();
+        assert!(scr[hc].contains("30%") && scr[hc].contains("200M"), "{}", scr[hc]);
+    }
+
+    #[test]
+    fn members_are_adjacent_and_groups_separated() {
+        let list = vec![
+            gi(1, "a-one", 10, "/h/a", "/h/a"),
+            gi(2, "a-two", 9, "/h/a", "/h/a"),
+            gi(3, "a-three", 8, "/h/a", "/h/a"),
+            gi(4, "b-one", 7, "/h/b", "/h/b"),
+            gi(5, "loose", 6, "", "/tmp"),
+        ];
+        let mut sw = Switcher::new(list, Some(1));
+        let scr = screen(&mut sw, 80, 24);
+        let row = |n: &str| scr.iter().position(|l| l.contains(n)).unwrap();
+        // header, 3 members, blank, header, member, blank, ungrouped
+        let (ha, hb) = (row("│ a "), row("│ b "));
+        assert_eq!((row("#1 ") - ha, row("#2 ") - ha, row("#3 ") - ha), (1, 2, 3));
+        assert_eq!(hb - row("#3 "), 2);
+        assert!(scr[hb - 1].trim_matches('│').trim().is_empty());
+        assert_eq!(row("#5 ") - row("#4 "), 2);
+        // ungrouped sessions among themselves keep the old spacing when it fits
+        let mut list = vec![gi(1, "a-one", 10, "/h/a", "/h/a")];
+        list.extend((2..=3).map(|i| gi(i, "loose", 10 - i as u64, "", "/tmp")));
+        let mut sw = Switcher::new(list, Some(1));
+        let scr = screen(&mut sw, 80, 24);
+        let row = |n: &str| scr.iter().position(|l| l.contains(n)).unwrap();
+        assert_eq!(row("#3 ") - row("#2 "), 2);
+        // too many rows for blank lines: everything is compact
+        let list: Vec<_> = (1..=7).map(|i| gi(i, "n-m", 20 - i as u64, if i < 4 { "/h/a" } else if i < 6 { "/h/b" } else { "" }, "/h/a")).collect();
+        let mut sw = Switcher::new(list, Some(1));
+        let scr = screen(&mut sw, 80, 13);
+        let first = scr.iter().position(|l| l.contains("│ a ")).unwrap();
+        assert!(scr[first..first + 8].iter().all(|l| !l.trim_matches('│').trim().is_empty()), "{scr:?}");
+    }
+
+    #[test]
+    fn selected_header_has_gutter_and_topics_in_the_detail_area() {
+        let mut list = grouped();
+        list[0].recap = "ship the api".into();
+        list[1].recap = "fixing the order tests".into();
+        list[0].summary = "A summary that must not show at the group level.".into();
+        let mut sw = Switcher::new(list, Some(1));
+        sw.ascii = false;
+        // session level: the summary of the selected session
+        let out = sw.render(80, 24, 100);
+        assert!(out.contains("A summary that must not"));
+        sw.handle(Key::Left);
+        let out = sw.render(80, 24, 100);
+        // the header carries the accent gutter and bold; the member rows do not
+        assert_eq!(out.matches("\x1b[36m▌").count(), 1);
+        let after = out.split("\x1b[36m▌").nth(1).unwrap();
+        let rest = &after[..after.find('│').unwrap()];
+        assert!(rest.contains("\x1b[1m") && rest.contains("\x1b[22m a") || rest.contains("\x1b[1ma"), "{rest:?}");
+        // the detail area lists the members' topics instead of a summary
+        assert!(!out.contains("A summary that must not"));
+        let scr: Vec<String> = (1..=24).map(|r| text_at(&out, r)).collect();
+        assert!(scr.iter().any(|l| l.contains("#1 ship the api")) && scr.iter().any(|l| l.contains("#2 fixing the order tests")), "{scr:?}");
+        // ASCII gutter
+        sw.ascii = true;
+        assert!(sw.render(80, 24, 100).contains("\x1b[36m>"));
+        // an ungrouped entry at the group level looks like a selected session and shows its summary
+        sw.handle(Key::Down);
+        sw.handle(Key::Down);
+        sw.handle(Key::Down);
+        assert_eq!(sel_id(&sw), 5);
+    }
+
+    #[test]
+    fn small_terminals_stay_in_bounds_with_groups() {
+        let mut list = grouped();
+        list[1].status = "✗ cargo test (101) · {ago}".into();
+        list[1].recap = "a topic that is far too long for forty columns".into();
+        list[3].cpu_pct = 300.0;
+        list[3].rss_bytes = 2 << 30;
+        list.push(gi(7, "ml", 1, "/h/averyveryveryverylonggrouplabelthatdoesnotfit", "/h/averyveryveryverylonggrouplabelthatdoesnotfit"));
+        for (cols, rows) in [(80u16, 24u16), (40, 10), (50, 12), (45, 8), (120, 60), (60, 6)] {
+            for ascii in [false, true] {
+                let mut sw = Switcher::new(list.clone(), Some(3));
+                sw.ascii = ascii;
+                for step in 0..24 {
+                    let out = sw.render(cols, rows, 100);
+                    for (r, t) in rows_of(&out) {
+                        assert!(r <= rows as usize && t.chars().count() <= cols as usize, "{cols}x{rows} step {step} row {r}: {t:?}");
+                    }
+                    for r in 1..=rows as usize {
+                        let t = text_at(&out, r);
+                        assert!(t.is_empty() || t.chars().count() == cols.min(100) as usize || rows >= 50, "{cols}x{rows} row {r}: {t:?}");
+                    }
+                    match step {
+                        0..=7 => sw.handle(Key::Down),
+                        8 => sw.handle(Key::Left),
+                        9..=14 => sw.handle(Key::Down),
+                        15 => sw.handle(Key::Right),
+                        16..=19 => sw.handle(Key::Up),
+                        20 => sw.handle(Key::Left),
+                        _ => sw.handle(Key::Up),
+                    };
+                    // the selection is always visible: it is the only row with a gutter
+                    let out = sw.render(cols, rows, 100);
+                    assert!(out.contains(if ascii { "\x1b[36m>" } else { "\x1b[36m▌" }), "{cols}x{rows} step {step}: selection scrolled out");
+                }
+            }
+        }
+        // 40 columns: the header is the label, the icons and a heat glyph
+        let mut sw = Switcher::new(list, Some(3));
+        sw.ascii = false;
+        let scr = screen(&mut sw, 40, 14);
+        let h = scr.iter().find(|l| l.starts_with("│ a ")).unwrap();
+        assert!(h.contains('✗') && !h.contains("~/a"), "{h}");
+    }
+
+    #[test]
+    fn filter_by_group_or_by_member() {
+        let mut sw = Switcher::new(grouped(), Some(3));
+        // a group's label shows the whole group
+        for c in "a".chars() {
+            sw.handle(Key::Char(c));
+        }
+        sw.handle(Key::Ctrl('u'));
+        for c in "/h/a".chars().skip(3) {
+            sw.handle(Key::Char(c));
+        }
+        let mut sw2 = Switcher::new(grouped(), Some(3));
+        for c in "~/a".chars() {
+            sw2.handle(Key::Char(c));
+        }
+        assert_eq!(ids(&sw2).iter().filter(|i| [1, 2].contains(i)).count(), 2);
+        // a member's own text shows only that member, with its header
+        let mut sw = Switcher::new(grouped(), Some(3));
+        for c in "a-two".chars() {
+            sw.handle(Key::Char(c));
+        }
+        assert_eq!(ids(&sw), vec![2]);
+        let scr = screen(&mut sw, 80, 24);
+        assert!(scr.iter().any(|l| l.contains("│ a ")) && scr.iter().any(|l| l.contains("#2 ")) && !scr.iter().any(|l| l.contains("#1 ")), "{scr:?}");
+        assert_eq!(sw.handle(Key::Enter), Action::Attach(2));
+        // the label of group b: all members of b, nobody else
+        let list = vec![gi(1, "x-one", 10, "/h/shop", "/h/shop"), gi(2, "x-two", 9, "/h/shop", "/h/shop/api"), gi(3, "other", 8, "/h/zed", "/h/zed")];
+        let mut sw = Switcher::new(list, None);
+        for c in "shop".chars() {
+            sw.handle(Key::Char(c));
+        }
+        assert_eq!(ids(&sw), vec![1, 2]);
+        // search mode ignores groups and the arrows
+        sw.handle(Key::Ctrl('s'));
+        sw.handle(Key::Left);
+        assert_eq!(sw.level, Level::Session);
+    }
+
+    #[test]
+    fn hint_advertises_the_arrows_only_where_they_fit() {
+        let mut sw = Switcher::new(grouped(), Some(3));
+        sw.ascii = false;
+        let wide = screen(&mut sw, 140, 24);
+        assert!(wide.iter().any(|l| l.contains("←/→ groups")), "{wide:?}");
+        for cols in [100u16, 80, 60, 40] {
+            let scr = screen(&mut sw, cols, 24);
+            let hint = &scr[22];
+            assert!(hint.chars().count() == cols as usize, "{hint}");
+            if hint.contains("groups") {
+                assert!(hint.contains("RET") && hint.contains("C-g"), "{hint}");
+            }
+        }
+        // no groups, no advertising
+        let mut sw = Switcher::new(vec![info(1, "calm-otter", 0, 1)], None);
+        assert!(!screen(&mut sw, 140, 24).iter().any(|l| l.contains("groups")));
     }
 }

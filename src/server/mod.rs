@@ -2,10 +2,12 @@
 //! Everything runs on one thread, so shared state is `Rc<RefCell<_>>`; borrows are never held across `.await`.
 
 mod api;
+mod groups;
 mod guard;
 #[cfg(feature = "llm")]
 mod llm;
 mod namer;
+mod privacy;
 mod prompt;
 mod naming;
 mod resources;
@@ -145,6 +147,8 @@ struct State {
     gate_msg: Option<String>,
     /// Sessions in the running batch: transcript mark and context at job creation.
     inflight: HashMap<SessionId, (u64, String, u64)>,
+    /// Group keys as last seen on the naming tick, to push a change (cwd moves) to the clients.
+    seen_groups: Vec<(SessionId, Option<String>)>,
     sampler: resources::Sampler,
     sampled_at: Option<Instant>,
 }
@@ -200,14 +204,30 @@ impl State {
     }
 
     fn infos(&self) -> Vec<SessionInfo> {
-        self.sessions
+        let mut v: Vec<SessionInfo> = self
+            .sessions
             .values()
             .map(|s| {
                 let mut i = s.info(self.attached(s.id).count() as u32);
                 i.pending = self.inflight.contains_key(&s.id);
                 i
             })
-            .collect()
+            .collect();
+        let mut groups = groups::assign(&v.iter().map(|i| (i.id, i.cwd.clone())).collect::<Vec<_>>(), &home_dir());
+        for i in &mut v {
+            i.group = groups.remove(&i.id);
+        }
+        v
+    }
+
+    /// Did a session move to another group since the last call? (Groups follow the cwd; this runs on the naming tick.)
+    fn groups_changed(&mut self) -> bool {
+        let now: Vec<(SessionId, Option<String>)> = {
+            let mut v: Vec<_> = self.infos().into_iter().map(|i| (i.id, i.group.map(|g| g.key))).collect();
+            v.sort();
+            v
+        };
+        std::mem::replace(&mut self.seen_groups, now.clone()) != now
     }
 
     fn broadcast_paused(&self) {
@@ -354,7 +374,8 @@ impl State {
         }
         cands.truncate(NAMER_MAX_JOBS);
         let mut jobs = Vec::new();
-        let home = std::env::var("HOME").unwrap_or_default();
+        let ident = privacy::Identity::current();
+        let home = ident.home.clone();
         for (c, p) in cands {
             let (new, sid) = (c.new, c.sid);
             let s = self.sessions.get_mut(&sid).unwrap();
@@ -367,6 +388,8 @@ impl State {
             } else {
                 namer::guess_digest(&header, &s.tw.tail(new.min(8192) as usize), &fg, prev.as_deref())
             };
+            // The model never sees the home directory, the login name or the host name.
+            let text = ident.scrub(&text);
             s.dirty = false;
             self.inflight.insert(sid, (s.tw.written(), p.ctx.clone(), s.log.covered_seq()));
             jobs.push(namer::Job { sid, text });
@@ -506,6 +529,10 @@ impl State {
     }
 }
 
+fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_default()
+}
+
 /// Hidden debug command: `nt name-test <file>...` summarizes text files the way the namer does, in one batch
 /// (one model load, one prefix evaluation). A file that already is a digest (starts with `cwd:`; a leading
 /// `# gold:` line is dropped) is used as is. Prints name, topic, timings and peak RSS.
@@ -525,6 +552,7 @@ pub fn name_test(cfg: &Config, files: &[String], cwd: Option<&str>) -> Result<()
         } else {
             namer::guess_digest(&shell::header(Path::new(&cwd), &home), &text, "", None)
         };
+        let digest = privacy::Identity::current().scrub(&digest);
         eprintln!("[{i}] {f}\n{digest}");
         jobs.push(namer::Job { sid: i as SessionId, text: digest });
     }
@@ -650,6 +678,7 @@ async fn serve(cfg: Config, sock: &Path) -> Result<()> {
         naming_error: String::new(),
         gate_msg: None,
         inflight: HashMap::new(),
+        seen_groups: Vec::new(),
         sampler: resources::Sampler::default(),
         sampled_at: None,
     }));
@@ -721,7 +750,7 @@ async fn naming_loop(st: Shared) {
         }
         let (jobs, cfg) = {
             let mut s = st.borrow_mut();
-            if !force && s.heuristic_names() {
+            if !force && (s.heuristic_names() | s.groups_changed()) {
                 s.broadcast_sessions();
             }
             let gate = s.gate_msg.clone();

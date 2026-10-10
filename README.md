@@ -69,7 +69,7 @@ server sends.
 nt                   # start a new session locally; the daemon starts on demand
 nt myserver          # start a new session on myserver: ssh bootstraps the daemon, then nt connects directly over TCP
 nt -s [myserver]     # open the session list (with no sessions, a new one is started)
-nt ls [myserver]     # print sessions, one line each: id, name, status, topic
+nt ls [myserver]     # print sessions grouped by project folder, one line each: id, name, status, topic
 nt restart [myserver]  # restart the nt server after an upgrade (ends its sessions)
 nt --help | --version
 ```
@@ -93,25 +93,13 @@ Prefix is `C-]` (config `prefix`). Everything else goes straight to the shell.
 | `C-] q` | quit the client (also while reconnecting) |
 | `C-] ]` | send a literal `C-]` |
 
-The switcher looks like this (the GIF above shows it live):
-
-```
-┌─ nt: 4 sessions · cpu 130% · ram 2.1G ───────────────────────────────┐
-│> nt                                                                  │
-│ *#3 nt-reconnect      vim   ~/src/nt                ▍   4%  ▌ 310M   │
-│       ✎ vim src/proto.rs                                             │
-│       nt reconnect: proto type fixes                                 │
-│▌ #1 webshop-api       bash  ~/work/webshop          █▌ 71%  ▎  95M   │
-│▌      ✗ cargo test (101) · 5s ago                                    │
-│▌      webshop api: fixing order tests                                │
-│  #2 nas01-upgrade     bash  nas01                        0%     12M  │
-│  #4 acme-db-migration make  ~/acme                 ███ 99%  ██ 1.4G  │
-│ Working on the nt reconnect logic in ~/src/nt. Fixed a type error in │
-│ proto.rs after a failed cargo test; tests now pass. Started          │
-│ deploying with make deploy.                                          │
-│RET attach  C-s search  C-o new  M-r rename  C-k kill  M-i info  C-g  │
-└──────────────────────────────────────────────────────────────────────┘
-```
+Sessions are grouped by folder tree. A session's project is the outermost directory above its shell's working directory that holds a
+`.git` or a project file (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, `Makefile`, `CMakeLists.txt`, `.hg`), looked for
+only below `$HOME`; sessions in nested repos join the outer project. Sessions outside any project are grouped when their directories are
+nested (`/etc/nginx` and `/etc/nginx/conf.d`), never under `$HOME`, `/`, `/tmp` or a top-level directory. A group shows a header with
+the folder, the status icons of its sessions (worst first) and the summed CPU/RAM, its sessions are indented below it with the
+subdirectory in place of the working directory, and ungrouped sessions come last. Groups follow the working directory, so `cd` moves a
+session between them. `nt ls` prints the same grouping. Typing a group's name in the filter shows the whole group.
 
 The list works like alt-tab: the current session is first (marked `*`), then the others by most recent use (attach or typing),
 sessions whose shell has exited last. The current session is preselected (`RET` just closes the switcher); `C-] l` jumps to the last session you were in. The order is fixed when the switcher opens: live updates (status, topic, CPU) change what is shown, never where it is,
@@ -120,7 +108,8 @@ bold name; other entries' topics are dim. Typing filters (best match first, rece
 
 | keys | action |
 |---|---|
-| `C-n` `C-p` / arrows | move; `C-v` `M-v` / PgDn PgUp page; `M-<` `M->` first / last |
+| `C-n` `C-p` / `↑` `↓` | move over the sessions (across groups); `C-v` `M-v` / PgDn PgUp page; `M-<` `M->` first / last |
+| `←` / `→` | `←` moves up to the group level (`↑` `↓` then move between groups; an ungrouped session is its own entry), `→` goes back into the selected group, onto its most recently used session. `RET` on a group attaches to that session. The filter cursor keeps `C-b` `C-f` |
 | `RET` | attach |
 | `C-o` or `M-RET` | new session |
 | `M-r` | rename (RET confirm, C-g cancel, empty = automatic name) |
@@ -160,7 +149,8 @@ foreground command and git repo or directory; the LLM refines name and topic. A 
   does not include API access. The command digest (cwd, repo, branch, recent commands with status and a few output lines) is sent
   to the provider after masking likely secrets (`key=value` pairs with secret-looking keys, bearer tokens, `--password` flags,
   URL credentials, long hex/base64 runs, well-known token prefixes). Masking is best effort. Use `local` or `off` if your
-  terminals may show sensitive data.
+  terminals may show sensitive data. Whatever the backend, the digest never contains your home directory path (shown as `~`), your
+  login name (`user`) or the short host name (`host`).
 - **`llm = "off"`**: heuristic names and no topic; the status line still works.
 
 ### When it runs

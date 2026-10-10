@@ -380,6 +380,7 @@ impl Session {
             cpu_pct: self.cpu_pct,
             rss_bytes: self.rss_bytes,
             pending: false,
+            group: None,
         }
     }
 }

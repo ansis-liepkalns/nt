@@ -217,6 +217,8 @@ def build_home(root):
             "GIT_COMMITTER_EMAIL": "dev@example.com", "HOME": str(home), "PATH": os.environ["PATH"]}
     projects = {
         "webshop": {"Makefile": MAKEFILE, "README.md": "# webshop\nA small online shop: cart, checkout, orders.\n",
+                    "frontend/package.json": '{\n  "name": "webshop-frontend",\n  "version": "0.4.0",\n  "scripts": {"dev": "vite", "build": "vite build"}\n}\n',
+                    "frontend/src/App.jsx": "export default function App() { return <Cart/>; }\n",
                     "tests/test_cart.py": "def test_checkout_applies_discount():\n    pass\n", "logs/.keep": ""},
         "raytracer": {"Cargo.toml": '[package]\nname = "raytracer"\nversion = "0.3.1"\nedition = "2021"\n',
                       "src/lib.rs": "pub mod geometry;\n", "README.md": "# raytracer\nA toy path tracer.\n"},
@@ -325,6 +327,8 @@ def main():
                                         ("echo '# TODO: coupon rounding' >> tests/test_cart.py", r"dev@box"),
                                         ("git diff --stat", r"dev@box"), ("make test", r"Error 1")])
         start_session(a.nt, env, home, [("cd ~/src/webshop", r"dev@box"), ("tail -f logs/app.log", r"refund issued")])
+        start_session(a.nt, env, home, [("cd ~/src/webshop/frontend", r"dev@box"), ("less package.json", r"package.json")])
+        start_session(a.nt, env, home, [("python -m http.server 8000", r"Serving HTTP")])
         start_session(a.nt, env, home, [("cd ~/src/sentiment", r"dev@box"), ("ls", r"dev@box"),
                                         ("head -3 train.py", r"dev@box"), ("git log --oneline", r"dev@box"),
                                         ("python train.py", r"epoch\s+8/")])
@@ -357,7 +361,11 @@ def main():
         t.pump(0.5)
         t_b = clock()
         t.pump(3.5)                                                 # the updated topic and summary
-        t.send(C_N); t.pump(3.2)                                    # the training session: a richer summary
+        for key, wait in ((b"\x1b[B", 1.6), (b"\x1b[B", 1.6),      # down across the sessions of the groups
+                          (b"\x1b[D", 2.2),                       # left: up to the group level
+                          (b"\x1b[B", 1.4), (b"\x1b[B", 1.4),     # down between the group headers
+                          (b"\x1b[C", 2.0)):                      # right: back into the group
+            t.send(key); t.pump(wait)
         t.send(C_S); t.pump(0.8)                                    # full-text search over the transcripts
         t.type("refund", 0.15); t.pump(2.5)
         t.send(RET); t.pump(2.5)                                    # attach to the log session

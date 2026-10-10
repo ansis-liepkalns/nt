@@ -358,3 +358,17 @@ mod thread_tests {
         assert_eq!(thread_counts(48, Some(0)), (1, 1));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_different_prompt_prefix_is_a_different_cache_key() {
+        let m = Path::new("/models/x.gguf");
+        let a = [LlamaToken(1), LlamaToken(2), LlamaToken(3)];
+        let b = [LlamaToken(1), LlamaToken(2), LlamaToken(4)];
+        assert_eq!(cache_key(m, 10, &a, 256), cache_key(m, 10, &a, 256));
+        assert_ne!(cache_key(m, 10, &a, 256), cache_key(m, 10, &b, 256));
+    }
+}

@@ -14,7 +14,8 @@ and session names that the server picks on its own. It does not split panes.
 nt [<ssh-dest>] [-- ssh args]     start a new session on the local daemon (unix socket, no crypto; started if needed),
                          or remote: bootstrap over ssh, then direct TCP
 nt -s | --sessions [<ssh-dest>]  open the session list (switcher); with no sessions, start a new one
-nt ls [<ssh-dest>]       print sessions, one line each: id, name, status, topic
+nt ls [<ssh-dest>]       print sessions, one line each: id, name, status, topic; grouped like the switcher (header line per group,
+                         members indented by 2, ungrouped sessions last)
 nt restart [<ssh-dest>]  stop a running daemon of any version and start the current one (ends its sessions);
                          remote = `nt restart` over ssh, found the same way as for bootstrap
 nt -h | --help | help, nt -V | --version
@@ -72,7 +73,7 @@ enum S2C {
 }
 ```
 `SessionInfo` carries id, name, name source (`Initial | Heuristic | Llm | User`; `User` is locked), timestamps, client count, size,
-cwd, foreground command, status, topic (`recap`), summary, exited flag, cpu and rss. `PROTO_VERSION` is 4 (`pending`, `S2C::NamerError`, `S2C::NamerPaused`).
+cwd, foreground command, status, topic (`recap`), summary, exited flag, cpu and rss, `group: Option<GroupInfo {key, label, shown}>`. `PROTO_VERSION` is 6 (`group`; before: `pending`, `S2C::NamerError`, `S2C::NamerPaused`).
 
 Version mismatch: `Hello` is the first variant of `C2S` and `proto` its first field, and the server decodes only that prefix of the first
 frame (`FrameReader::read_hello`), so any peer version is recognised even if other fields changed. On a mismatch the server sends
@@ -107,6 +108,29 @@ plaintext but sits in a 0700 directory.
   repaints locally without a round trip.
 - Passthrough by default; prefix key `C-]` (configurable): `C-] C-]`/`s` switcher, `n`/`p` next/previous session, `l` last,
   `c` new, `r` rename, `k` close (y/n on a live session; an exited one closes at once), `d` detach, `q` quit, `]` literal prefix.
+- **Groups** (`server/groups.rs`; the server computes them because it knows `$HOME` and the disk; `infos()` recomputes them for every push, and the
+  naming tick pushes when a session changed group). Project root of a session = the *outermost* ancestor-or-self of its shell cwd (read from
+  /proc, so a foreground program does not matter) holding `.git` (directory or file, for worktrees) or one of `Cargo.toml package.json
+  pyproject.toml go.mod Makefile CMakeLists.txt .hg`; only strictly below `$HOME` when the cwd is under it, and never `/`, `/home`, `/tmp`,
+  `/root` or `$HOME` itself. Nested repos are therefore absorbed by the outermost project. Sessions without a project: those whose cwds are
+  nested form a group anchored at the shallowest such cwd, unless that is `$HOME`, `/`, `/tmp`, `/home`, a depth-1 path or an ancestor of some
+  session's project root (a shell in `~/src` does not swallow `~/src/webshop`); a lone one stays ungrouped. Single-session projects still get a
+  group. `GroupInfo.key` is the absolute root, `label` its basename (the whole path outside `$HOME`), `shown` the `~`-abbreviated path (the client
+  does not know the server's home).
+  Display: a header per group (bold label, dim path, status icons worst first `✗ ⏵ ✎ ✓` deduped and colored, summed CPU/RAM in the same
+  bar/number layout as session rows; at 50 columns and below only label, icons and a heat glyph). Members are indented by 2, show `subdir/`
+  (relative to the root) instead of the cwd and lose a redundant `<label>:` prefix of heuristic names. Ungrouped sessions follow, in the old
+  format. One blank line separates blocks (groups, and each ungrouped session) when everything including status and topic lines fits, never
+  between the members of a group. Order, snapshotted when the switcher opens like the session order: the current session's group, then groups by
+  the most recent use of any member, then ungrouped sessions; inside a group the current session first, then recency. New sessions join the end of
+  their group, new groups go after the existing groups. Under a filter, groups and members rank by best match; the group's label and path are part
+  of each member's haystack, so a group name shows the whole group and other terms only the matching members (with their header). Sort modes
+  order members by load and groups by their summed load. `C-s` search is not grouped.
+  Navigation: `↑ ↓ C-p C-n` move over sessions across groups, skipping headers. `←` goes to the *group level* (the selected session's group; an
+  ungrouped session is its own entry), where `↑ ↓` move between groups and ungrouped entries; `→` there enters the group on its most recently
+  used session; `RET` on a group header attaches to that session. `→` at the session level and both arrows in search mode do nothing and
+  `←/→` no longer move the filter cursor (`C-b C-f` do). A selected header has the same `▌` gutter as a selected session and the summary area
+  lists the members' topics instead of a summary. Renaming and closing need a session, so they do nothing on a group header.
 - Switcher overlay: whole screen below 50 rows, otherwise a centered box of at most 100x30; usable at 40x10. Each entry shows
   `#id name`, client count, foreground command, cwd, age, and a usage cell (CPU/RAM bars, narrower layouts degrade to a one-glyph
   heat, `NT_ASCII=1` or a non-UTF-8 locale uses ASCII). When there is room each entry also shows the status line and the topic.
@@ -212,6 +236,12 @@ foreground: make deploy
   continuation lines up to a blank line) are kept, then junk filters (`sanitize_name`, `sanitize_recap`, `sanitize_summary`; a summary
   that is too long is cut after the last full sentence that fits, a summary of fewer than 4 words is dropped). The daemon stores the
   summary and the new `summary_seq` only when a topic or summary came back.
+- **Privacy of the digest**: before the digest goes to the local model or the API (`server/privacy.rs`; the previous summary is part of it) the
+  home directory path becomes `~`, the login name (`$USER`, `$LOGNAME`, else the last component of `$HOME`) becomes `user` and the short host name
+  becomes `host`. Names are replaced only as whole words / path components (neighbours are not letters, digits or `_`; user `ann` leaves
+  `annotate` alone), in the exact and the lowercase form, and only if they have at least 3 characters. The prompt says these are placeholders to
+  never interpret (a login name that looks like a word or acronym would otherwise end up in topics). Changing the prompt text changes the
+  evaluated prefix tokens and with them the prefix-cache key, so the old cache file is replaced on the next start.
 - **Prompt**: prompt v3, the one chosen by the benchmark (`src/server/prompt.rs`, `bench/prompts/v3.json`, generated by
   `bench/prompt_from_rs.py`): a system message with rules (including how to update an earlier summary and not to invent details) and five
   few-shot user/assistant turns (three first-run digests, two rolling updates), then the digest as the last user turn, rendered with the
