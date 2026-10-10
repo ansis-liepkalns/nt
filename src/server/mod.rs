@@ -1182,8 +1182,9 @@ fn rename(st: &Shared, cid: u64, sid: SessionId, name: &str) {
     s.broadcast_sessions();
 }
 
-/// Close a session: an exited one goes away at once; otherwise SIGHUP the shell's process group
-/// (SIGKILL two seconds later if it is still around) and end the session when the shell is gone.
+/// Close a session: an exited one goes away at once; otherwise SIGHUP every process group in it, SIGKILL them
+/// two seconds later, and end the session then even if something (a process that escaped the session but kept
+/// the pty open) would keep the terminal from closing.
 fn kill(st: &Shared, cid: u64, sid: SessionId) {
     {
         let mut s = st.borrow_mut();
@@ -1202,6 +1203,8 @@ fn kill(st: &Shared, cid: u64, sid: SessionId) {
         if let Some(sess) = st.borrow().sessions.get(&sid) {
             sess.signal(Signal::SIGKILL);
         }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        st.borrow_mut().end_session(sid);
     });
 }
 

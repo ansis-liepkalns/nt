@@ -274,6 +274,32 @@ fn shell_exit_ends_session_and_ping() {
 }
 
 #[test]
+fn kill_reaches_jobs_in_their_own_process_group() {
+    // Like `docker exec -it` in an interactive shell: a foreground job in its own process group that
+    // survives SIGHUP. Closing the session must still end it and the session.
+    let d = Daemon::start();
+    let mut c = d.connect();
+    let id = c.attach(None, None);
+    // `job$((1))` only expands in the output, not in the echoed command line.
+    c.input("bash -c 'trap \"\" HUP; echo job$((1))pid=$$:end$((2)); exec sleep 600'\n");
+    let out = c.wait_output(":end2");
+    let pid: i32 = out
+        .rsplit("job1pid=")
+        .next()
+        .and_then(|r| r.split(':').next())
+        .and_then(|n| n.parse().ok())
+        .expect("job pid");
+    c.send(&C2S::Kill { session: id });
+    c.wait_ended(id);
+    // The job got SIGKILL with the rest of the session (allow a moment for the kernel to reap it).
+    let gone = (0..50).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map(|s| s.contains(") Z ")).unwrap_or(true)
+    });
+    assert!(gone, "job {pid} survived the kill");
+}
+
+#[test]
 fn duplicate_input_is_dropped() {
     let d = Daemon::start();
     let mut c = d.connect();

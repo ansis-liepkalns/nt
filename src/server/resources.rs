@@ -14,6 +14,32 @@ pub fn parse_stat(s: &str) -> Option<(u32, u64, u64)> {
     Some((num(3)? as u32, num(11)? + num(12)?, num(21)?))
 }
 
+/// `(process group, session id)` from the contents of /proc/<pid>/stat.
+fn parse_pgrp_sid(s: &str) -> Option<(i32, u32)> {
+    let f: Vec<&str> = s[s.rfind(')')? + 1..].split_whitespace().collect();
+    // f[0] = state, f[1] = ppid, f[2] = pgrp, f[3] = session
+    Some((f.get(2)?.parse().ok()?, f.get(3)?.parse().ok()?))
+}
+
+/// Every process group with a process in session `sid` (the shell's own, plus its jobs such as a foreground
+/// `docker exec` that runs in a group of its own), so closing a session can signal all of them.
+pub fn process_groups(sid: u32) -> Vec<i32> {
+    let mut groups = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/proc") {
+        for e in rd.flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+            if let Some((pgrp, s)) = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().as_deref().and_then(parse_pgrp_sid)
+                && s == sid
+                && pgrp > 0
+                && !groups.contains(&pgrp)
+            {
+                groups.push(pgrp);
+            }
+        }
+    }
+    groups
+}
+
 struct Scan {
     /// pid -> (sid, ticks, pages)
     procs: HashMap<u32, (u32, u64, u64)>,

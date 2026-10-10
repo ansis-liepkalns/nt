@@ -388,8 +388,16 @@ impl Session {
         crate::proto::repaint(self.parser.screen())
     }
 
+    /// Signal every process group in the session: the shell's and its jobs' (a job runs in its own group, so
+    /// signalling only the shell's group misses e.g. a foreground `docker exec`).
     pub fn signal(&self, sig: Signal) {
-        let _ = killpg(Pid::from_raw(self.child.id() as i32), sig);
+        let shell = self.child.id() as i32;
+        let _ = killpg(Pid::from_raw(shell), sig);
+        for pgrp in super::resources::process_groups(shell as u32) {
+            if pgrp != shell {
+                let _ = killpg(Pid::from_raw(pgrp), sig);
+            }
+        }
     }
 
     /// Did anything happen since the summary was made (so it may describe a situation that is over)?
