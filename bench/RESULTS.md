@@ -116,3 +116,34 @@ python3 bench/report.py bench/results/full-v2.json
 python3 bench/run.py --models granite-4.0-1b-Q4_K_M.gguf --threads 2 --cache --out /tmp/one.json   # a single model
 ```
 Models and the llama.cpp build live in `~/.cache/nt-bench`. `run.py` resumes from its output file.
+
+## Screen input (prompt v4), Granite 4.0 1B vs LFM3-1.7B (2026-11-01)
+
+`bench/scenarios-v4/` (15 screen-format inputs, six of them rolling updates), llama-server built from llama.cpp master, 8 threads,
+Q4_K_M, a loaded 48-thread machine. Measured with the previous summary at the top of the input (the v4 layout); the scenario files have since been converted to
+the shipped v5 layout (`older history` at the end), so `run.py --prompt v5 --scenarios scenarios-v4` reproduces the v5 table below.
+
+| | Granite 4.0 1B | LFM3-1.7B |
+|---|---|---|
+| generation | ~25 tok/s | ~46 tok/s |
+| prompt reading | ~200 tok/s | ~410 tok/s |
+| rolling updates right (6) | 3 (copies the old failure in 15, stale topic in 14) | 6 with the previous summary placed after the screen (v5 layout, below) |
+| inventions | "conflicts were resolved and committed", "ready for use" | facts from the few-shot examples (web02, blog.example.org, a commit), "the user" |
+| style | plain, short | richer, but adds advice and guesses ("need to …", "likely …") |
+| thinking off | n/a | `enable_thinking=false` is ignored: it reasons, then repeats the answer after `</think>` (stop on `</think>`) |
+
+About 8 of 15 fully clean answers each. Extra prompt rules (no advice, never take facts from the examples) changed little for
+either model: few-shot contamination and summary copying look like a job for fine-tuning (no examples in the prompt). LFM3 cannot
+run inside nt yet: llama-cpp-sys-2 0.1.160 (the newest) bundles a llama.cpp without the LFM3 architecture.
+
+### Prompt v5: older history after the screen (shipped)
+
+v5 is v4 with the previous summary moved to the end of the input as `older history (before this screen; may be out of date): …`
+and the rules reworded to match ("the screen is newer and wins where they differ"). `bench/prompts/v5.json`, same 15 scenarios.
+
+| | Granite 4.0 1B, v4 | Granite 4.0 1B, v5 | LFM3-1.7B, v5 |
+|---|---|---|---|
+| rolling updates right (6) | 3 | 5 (still reports the old link error in 15) | 6 facts right; 15's topic still says "fixing linker error", adds advice |
+| first runs | unchanged | about the same (12 still invents a resolved merge) | not re-run |
+
+LFM3 sometimes echoes the label ("older history shows a prior failure"). Fine-tuning remains the fix for the remaining copying.

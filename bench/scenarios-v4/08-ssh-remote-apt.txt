@@ -1,0 +1,31 @@
+# gold: name: db01-upgrade | topic: upgrading packages on db01 over ssh; postgresql is running | summary must mention: ssh to db01, sudo apt upgrade completed, systemctl status shows postgresql active (running)
+cwd: ~
+foreground: ssh db01
+running command: ssh db01
+screen (newest at the bottom):
+| admin@db01:~$ sudo apt upgrade -y
+| Reading package lists... Done
+| Building dependency tree... Done
+| The following packages will be upgraded:
+|   libpq5 postgresql-15 postgresql-client-15 postgresql-common
+| 4 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+| Need to get 18.4 MB of archives.
+| Get:1 http://deb.debian.org/debian bookworm/main amd64 libpq5 amd64 15.8-0+deb12u1 [192 kB]
+| Fetched 18.4 MB in 2s (9,120 kB/s)
+| Preparing to unpack .../libpq5_15.8-0+deb12u1_amd64.deb ...
+| Setting up libpq5:amd64 (15.8-0+deb12u1) ...
+| Setting up postgresql-15 (15.8-0+deb12u1) ...
+| Processing triggers for libc-bin (2.36-9+deb12u7) ...
+| admin@db01:~$ systemctl status postgresql
+| ● postgresql.service - PostgreSQL RDBMS
+|      Loaded: loaded (/lib/systemd/system/postgresql.service; enabled; preset: enabled)
+|      Active: active (exited) since Sat 2026-10-31 09:14:02 UTC; 3 days ago
+|     Process: 812 ExecStart=/bin/true (code=exited, status=0/SUCCESS)
+|    Main PID: 812 (code=exited, status=0/SUCCESS)
+| admin@db01:~$ systemctl status postgresql@15-main
+| ● postgresql@15-main.service - PostgreSQL Cluster 15-main
+|      Loaded: loaded (/lib/systemd/system/postgresql@.service; enabled-runtime; preset: enabled)
+|      Active: active (running) since Tue 2026-11-03 10:41:19 UTC; 12s ago
+|    Main PID: 20417 (postgres)
+|       Tasks: 7 (limit: 9438)
+| admin@db01:~$

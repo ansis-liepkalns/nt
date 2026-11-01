@@ -1,0 +1,29 @@
+# gold: name: web-1-npm-build | topic: npm build fixed inside the web-1 container after installing the missing module | summary must mention: earlier npm build in container web-1 failed on missing module, npm install fixed it, npm run build now succeeds inside the container
+cwd: ~/src/shop (git shop, branch main)
+foreground: docker exec -it web-1 sh
+running command: docker exec -it web-1 sh
+screen (newest at the bottom):
+| /app # npm install
+|
+| added 3 packages, and audited 412 packages in 4s
+|
+| 87 packages are looking for funding
+|   run `npm fund` for details
+|
+| found 0 vulnerabilities
+| /app # npm run build
+|
+| > shop-web@2.4.0 build
+| > vite build
+|
+| vite v5.4.2 building for production...
+| transforming...
+| ✓ 148 modules transformed.
+| rendering chunks...
+| computing gzip size...
+| dist/index.html                   0.46 kB │ gzip:  0.30 kB
+| dist/assets/index-Bq3x9aKd.css   21.87 kB │ gzip:  4.92 kB
+| dist/assets/index-D81kPz0w.js   212.35 kB │ gzip: 68.40 kB
+| ✓ built in 3.12s
+| /app #
+older history (before this screen; may be out of date): Opened a shell in the web-1 container and ran npm run build; it failed with "Cannot find module 'sass'".

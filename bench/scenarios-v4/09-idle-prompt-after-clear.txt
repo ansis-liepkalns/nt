@@ -1,0 +1,6 @@
+# gold: name: portal-auth-rebase | topic: rebasing feature/auth onto main in portal (unchanged, screen was cleared) | summary must mention: git rebase of feature/auth in ~/src/portal, conflicts resolved earlier, nothing new since the screen was cleared
+cwd: ~/src/portal (git portal, branch feature/auth)
+last command: clear · ok
+screen (newest at the bottom):
+| user@host:~/src/portal$
+older history (before this screen; may be out of date): Rebasing branch feature/auth onto main in ~/src/portal; resolved conflicts in src/auth/session.ts and continued the rebase, tests were passing.

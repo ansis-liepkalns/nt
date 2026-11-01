@@ -1,0 +1,15 @@
+# gold: name: nginx-502-tail | topic: watching nginx access log with repeated 502 errors | summary must mention: tail -f of nginx access.log, many 502 Bad Gateway responses on /api/ endpoints, upstream likely down
+cwd: /var/log/nginx
+running command: tail -f /var/log/nginx/access.log
+screen (newest at the bottom):
+| 10.0.4.17 - - [01/Nov/2026:09:41:02 +0000] "GET /api/v1/items?page=2 HTTP/1.1" 502 157 "-" "Mozilla/5.0"
+| 10.0.4.22 - - [01/Nov/2026:09:41:02 +0000] "POST /api/v1/cart HTTP/1.1" 502 157 "-" "Mozilla/5.0"
+| 10.0.4.17 - - [01/Nov/2026:09:41:03 +0000] "GET /static/app.js HTTP/1.1" 200 48211 "-" "Mozilla/5.0"
+| 10.0.4.31 - - [01/Nov/2026:09:41:03 +0000] "GET /api/v1/items?page=1 HTTP/1.1" 502 157 "-" "curl/8.5.0"
+| 10.0.4.22 - - [01/Nov/2026:09:41:04 +0000] "GET /api/v1/me HTTP/1.1" 502 157 "-" "Mozilla/5.0"
+| 10.0.4.40 - - [01/Nov/2026:09:41:04 +0000] "GET /healthz HTTP/1.1" 502 157 "-" "kube-probe/1.29"
+| 10.0.4.17 - - [01/Nov/2026:09:41:05 +0000] "GET /api/v1/items?page=3 HTTP/1.1" 502 157 "-" "Mozilla/5.0"
+| 10.0.4.31 - - [01/Nov/2026:09:41:06 +0000] "POST /api/v1/login HTTP/1.1" 502 157 "-" "curl/8.5.0"
+| 10.0.4.22 - - [01/Nov/2026:09:41:06 +0000] "GET /favicon.ico HTTP/1.1" 200 1150 "-" "Mozilla/5.0"
+| 10.0.4.40 - - [01/Nov/2026:09:41:07 +0000] "GET /healthz HTTP/1.1" 502 157 "-" "kube-probe/1.29"
+| 10.0.4.17 - - [01/Nov/2026:09:41:08 +0000] "GET /api/v1/cart HTTP/1.1" 502 157 "-" "Mozilla/5.0"

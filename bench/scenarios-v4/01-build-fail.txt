@@ -1,0 +1,19 @@
+# gold: name: render-link-error | topic: cmake build of renderer fails with undefined reference to Mesh::load | summary must mention: cmake/make build, linker error, undefined reference to Mesh::load, build failed
+cwd: ~/src/renderer (git renderer, branch main)
+last command: make -j8 · exit 2
+screen (newest at the bottom):
+| user@host:~/src/renderer/build$ make -j8
+| [ 12%] Building CXX object CMakeFiles/renderer.dir/src/camera.cpp.o
+| [ 25%] Building CXX object CMakeFiles/renderer.dir/src/shader.cpp.o
+| [ 37%] Building CXX object CMakeFiles/renderer.dir/src/scene.cpp.o
+| [ 50%] Building CXX object CMakeFiles/renderer.dir/src/main.cpp.o
+| [ 62%] Linking CXX executable renderer
+| /usr/bin/ld: CMakeFiles/renderer.dir/src/scene.cpp.o: in function `Scene::addModel(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)':
+| scene.cpp:(.text+0x1f4): undefined reference to `Mesh::load(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)'
+| /usr/bin/ld: CMakeFiles/renderer.dir/src/main.cpp.o: in function `main':
+| main.cpp:(.text+0x8a): undefined reference to `Mesh::load(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)'
+| collect2: error: ld returned 1 exit status
+| make[2]: *** [CMakeFiles/renderer.dir/build.make:142: renderer] Error 1
+| make[1]: *** [CMakeFiles/Makefile2:83: CMakeFiles/renderer.dir/all] Error 2
+| make: *** [Makefile:91: all] Error 2
+| user@host:~/src/renderer/build$

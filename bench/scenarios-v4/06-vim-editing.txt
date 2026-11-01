@@ -1,0 +1,36 @@
+# gold: name: edit-ingest-py | topic: editing ingest.py in vim, working on the CSV loader function | summary must mention: editing ingest.py in vim, load_rows / CSV parsing code, file has unsaved changes
+cwd: ~/src/etl (git etl, branch main)
+title: "ingest.py (~/src/etl/pipeline) - VIM"
+foreground: vim pipeline/ingest.py
+running command: vim pipeline/ingest.py
+screen (newest at the bottom):
+| import csv
+| import logging
+| from pathlib import Path
+|
+| log = logging.getLogger(__name__)
+|
+|
+| def load_rows(path: Path, delimiter: str = ","):
+|     """Yield dict rows from a CSV file, skipping blank lines."""
+|     with path.open(newline="", encoding="utf-8") as fh:
+|         reader = csv.DictReader(fh, delimiter=delimiter)
+|         for lineno, row in enumerate(reader, start=2):
+|             if not any(row.values()):
+|                 continue
+|             try:
+|                 row["amount"] = float(row["amount"])
+|             except (KeyError, ValueError):
+|                 log.warning("bad amount on line %d", lineno)
+|                 continue
+|             yield row
+|
+|
+| def ingest(path: Path, db):
+|     n = 0
+|     for row in load_rows(path):
+|         db.insert("transactions", row)
+|         n += 1
+|     return n
+| pipeline/ingest.py [+]                                          18,34         Top
+| -- INSERT --

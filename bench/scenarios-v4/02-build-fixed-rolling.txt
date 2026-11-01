@@ -1,0 +1,30 @@
+# gold: name: parser-fix-tests-pass | topic: fixed the type error in parser.rs; cargo build and tests now pass | summary must mention: earlier cargo build failed with type error in src/parser.rs, now fixed, build succeeds, cargo test passes
+cwd: ~/src/tokenizer (git tokenizer, branch main)
+last command: cargo test · ok
+screen (newest at the bottom):
+| user@host:~/src/tokenizer$ vim src/parser.rs
+| user@host:~/src/tokenizer$ cargo build
+|    Compiling tokenizer v0.3.1 (/home/user/src/tokenizer)
+|     Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.41s
+| user@host:~/src/tokenizer$ cargo test
+|    Compiling tokenizer v0.3.1 (/home/user/src/tokenizer)
+|     Finished `test` profile [unoptimized + debuginfo] target(s) in 1.87s
+|      Running unittests src/lib.rs (target/debug/deps/tokenizer-5f1c2a9d3e7b4c60)
+|
+| running 14 tests
+| test lexer::tests::empty_input ... ok
+| test lexer::tests::handles_unicode ... ok
+| test parser::tests::nested_groups ... ok
+| test parser::tests::offset_is_usize ... ok
+| test parser::tests::trailing_comma ... ok
+| test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+|
+|    Doc-tests tokenizer
+|
+| running 2 tests
+| test src/lib.rs - (line 8) ... ok
+| test src/lib.rs - parse (line 31) ... ok
+| test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+|
+| user@host:~/src/tokenizer$
+older history (before this screen; may be out of date): Ran cargo build in project tokenizer; it failed with a type error (mismatched types, expected usize found i32) in src/parser.rs.

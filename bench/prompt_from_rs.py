@@ -12,6 +12,6 @@ shots_src = src[src.index("pub const SHOTS"):src.index("];", src.index("pub cons
 strs = [lit(m) for m in re.findall(r'"((?:[^"\\]|\\.)*)"', shots_src)]
 shots = [[strs[i], strs[i + 1]] for i in range(0, len(strs), 2)]
 mx = int(re.search(r"MAX_NEW_TOKENS: usize = (\d+)", src).group(1))
-name = sys.argv[1] if len(sys.argv) > 1 else "v3"
+name = sys.argv[1] if len(sys.argv) > 1 else "v5"
 json.dump(dict(system=system, shots=shots, suffix="", max_tokens=mx), open(f"{HERE}/prompts/{name}.json", "w"), indent=1)
 print(name, len(shots), "shots, max_tokens", mx)

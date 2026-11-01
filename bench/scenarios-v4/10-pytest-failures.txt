@@ -1,0 +1,21 @@
+# gold: name: billing-test-failures | topic: pytest run with 2 failing tests in billing | summary must mention: pytest run, 2 failed (test_proration and test_refund_rounding), assertion errors, 41 passed
+cwd: ~/src/billing (git billing, branch main)
+last command: pytest -q · exit 1
+screen (newest at the bottom):
+| E       assert Decimal('33.33') == Decimal('33.34')
+| E        +  where Decimal('33.33') = prorate(Decimal('100.00'), 20, 30).amount
+|
+| tests/test_invoice.py:58: AssertionError
+| ______________________________ test_refund_rounding _______________________________
+|
+|     def test_refund_rounding():
+|         r = refund(Decimal("19.99"), pct=Decimal("0.15"))
+| >       assert r == Decimal("3.00")
+| E       assert Decimal('2.99') == Decimal('3.00')
+|
+| tests/test_refund.py:22: AssertionError
+| =========================== short test summary info ===========================
+| FAILED tests/test_invoice.py::test_proration - assert Decimal('33.33') == Decimal('33.34')
+| FAILED tests/test_refund.py::test_refund_rounding - assert Decimal('2.99') == Decimal('3.00')
+| ======================== 2 failed, 41 passed in 3.57s =========================
+| user@host:~/src/billing$

@@ -30,13 +30,15 @@ CACHE_PROMPT = False
 def load_prompt(name):
     return json.load(open(f"{HERE}/prompts/{name}.json"))
 
+SCENARIOS = "scenarios"
+
 def scenarios():
     out = []
-    for p in sorted(glob.glob(f"{HERE}/scenarios/*.txt")):
+    for p in sorted(glob.glob(f"{HERE}/{SCENARIOS}/*.txt")):
         lines = open(p).read().split("\n")
         gold = lines[0].removeprefix("# gold:").strip()
         name = os.path.basename(p)[:-4]
-        # rolling scenarios: steps separated by "=== step N"; step 2+ get the model's previous summary prepended
+        # rolling scenarios: steps separated by "=== step N"; step 2+ get the model's previous summary appended (as nt does)
         steps = re.split(r"^=== step \d+\n", "\n".join(lines[1:]), flags=re.M)
         if len(steps) == 1:
             out.append((name, gold, steps[0].strip()))
@@ -73,7 +75,7 @@ def run_model(model, threads, pr, port):
             prev = ""
             for i, d in enumerate(steps):
                 if i > 0 and prev:
-                    d = f"earlier summary: {prev}\n" + d
+                    d = d.rstrip("\n") + f"\nolder history (before this screen; may be out of date): {prev}\n"
                 body = {"messages": messages(pr, d), "temperature": 0, "max_tokens": pr.get("max_tokens", 40),
                         "stop": ["\n\n"], "cache_prompt": CACHE_PROMPT,
                         "chat_template_kwargs": {"enable_thinking": False}}
@@ -125,8 +127,10 @@ if __name__ == "__main__":
     ap.add_argument("--threads", nargs="+", type=int, default=[1, 2])
     ap.add_argument("--out", required=True)
     ap.add_argument("--cache", action="store_true", help="reuse the KV cache of the constant prefix (system+few-shot)")
+    ap.add_argument("--scenarios", default="scenarios", help="scenario directory under bench/ (scenarios-v4: screen input)")
     a = ap.parse_args()
     CACHE_PROMPT = a.cache
+    SCENARIOS = a.scenarios
     pr = load_prompt(a.prompt)
     allres = json.load(open(a.out)) if os.path.exists(a.out) else {}  # resumable
     port = 8700

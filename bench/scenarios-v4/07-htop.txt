@@ -1,0 +1,22 @@
+# gold: name: htop-training-load | topic: monitoring system load with htop; python train.py using 800% CPU | summary must mention: htop open, python train.py using about 800% CPU, high load average
+cwd: ~/ml/experiments
+title: "htop"
+foreground: htop
+running command: htop
+screen (newest at the bottom):
+|   0[||||||||||||||||||||||||||||||||||||100.0%]   4[||||||||||||||||||||||||||||||||||||100.0%]
+|   1[||||||||||||||||||||||||||||||||||||100.0%]   5[||||||||||||||||||||||||||||||||||||100.0%]
+|   2[||||||||||||||||||||||||||||||||||||100.0%]   6[||||||||||||||||||||||||||||||||||||100.0%]
+|   3[||||||||||||||||||||||||||||||||||||100.0%]   7[||||||||||||||||||||||||||||||||||||100.0%]
+|   Mem[||||||||||||||||||||||||||||||||10.2G/31.3G]   Tasks: 214, 891 thr; 9 running
+|   Swp[|                                  0K/2.00G]   Load average: 8.12 7.64 5.31
+|                                                     Uptime: 3 days, 04:12:55
+|
+|     PID USER      PRI  NI  VIRT   RES   SHR S  CPU%-MEM%   TIME+  Command
+|   48213 user       20   0 18.2G 6.4G  312M R 800.0 20.4  41:07.55 python train.py --epochs 40 --batch 256
+|    1432 user       20   0 4128M  612M  201M S   3.3  1.9   8:14.02 /usr/lib/firefox/firefox
+|    1021 root       20   0  412M  96.1M 58.2M S   1.3  0.3   2:11.80 /usr/lib/xorg/Xorg
+|   48390 user       20   0 12.4M  5120  3584 R   0.7  0.0   0:00.31 htop
+|     912 root       20   0  1.2G   44.0M 29.0M S   0.0  0.1   0:09.17 /usr/bin/containerd
+|       1 root       20   0  166M  11.8M  8192 S   0.0  0.0   0:04.52 /sbin/init splash
+| F1Help  F2Setup F3SearchF4FilterF5Tree  F6SortByF7Nice -F8Nice +F9Kill  F10Quit

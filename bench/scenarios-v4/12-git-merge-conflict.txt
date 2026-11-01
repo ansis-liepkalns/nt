@@ -1,0 +1,26 @@
+# gold: name: merge-conflicts-main | topic: merging main into feature branch with conflicts in two files | summary must mention: git merge main produced CONFLICT in src/config.py and src/api/routes.py, both files modified/unmerged, needs manual resolution
+cwd: ~/src/inventory (git inventory, branch feature/bulk-import)
+last command: git status · ok
+screen (newest at the bottom):
+| user@host:~/src/inventory$ git merge main
+| Auto-merging src/api/routes.py
+| CONFLICT (content): Merge conflict in src/api/routes.py
+| Auto-merging src/config.py
+| CONFLICT (content): Merge conflict in src/config.py
+| Automatic merge failed; fix conflicts and then commit the result.
+| user@host:~/src/inventory$ git status
+| On branch feature/bulk-import
+| You have unmerged paths.
+|   (fix conflicts and run "git commit")
+|   (use "git merge --abort" to abort the merge)
+|
+| Changes to be committed:
+| 	modified:   README.md
+| 	new file:   src/importer.py
+|
+| Unmerged paths:
+|   (use "git add <file>..." to mark resolution)
+| 	both modified:   src/api/routes.py
+| 	both modified:   src/config.py
+|
+| user@host:~/src/inventory$

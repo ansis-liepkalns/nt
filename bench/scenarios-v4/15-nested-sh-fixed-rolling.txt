@@ -1,0 +1,16 @@
+# gold: name: renderer-build | topic: renderer build fixed, links in a nested shell | summary must mention: earlier link error undefined reference to Mesh::load, build now completes (Built target renderer)
+cwd: ~/src/renderer
+foreground: sh
+running command: cd ~/src/renderer && sh
+screen (newest at the bottom):
+| user@host:~$ cd ~/src/renderer && sh
+| $ sh ~/build.sh
+| [ 92%] Linking CXX executable renderer
+| /usr/bin/ld: scene.cpp:(.text+0x2a): undefined reference to Mesh::load(std::string const&)
+| collect2: error: ld returned 1 exit status
+| make: *** [Makefile:12: renderer] Error 2
+| $ sh ~/build2.sh
+| [ 92%] Linking CXX executable renderer
+| [100%] Built target renderer
+| $
+older history (before this screen; may be out of date): Worked on building the renderer in ~/src/renderer. The build.sh script linked the renderer, but encountered an undefined reference to Mesh::load(std::string const&) during linking.

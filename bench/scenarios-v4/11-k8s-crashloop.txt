@@ -1,0 +1,16 @@
+# gold: name: api-crashloop | topic: debugging CrashLoopBackOff of the api pod caused by a missing config value | summary must mention: kubectl shows api pod in CrashLoopBackOff, logs show config error (DATABASE_URL missing / failed to load config)
+cwd: ~/ops/clusters
+last command: kubectl logs api-7d9f8b6c5-x2kqp -n prod · ok
+screen (newest at the bottom):
+| user@host:~/ops/clusters$ kubectl get pods -n prod
+| NAME                         READY   STATUS             RESTARTS      AGE
+| api-7d9f8b6c5-x2kqp          0/1     CrashLoopBackOff   6 (47s ago)   9m
+| api-7d9f8b6c5-m8wzt          0/1     CrashLoopBackOff   6 (62s ago)   9m
+| worker-5c6b7d8f9-hq4lr       1/1     Running            0             2d
+| redis-0                      1/1     Running            0             12d
+| user@host:~/ops/clusters$ kubectl logs api-7d9f8b6c5-x2kqp -n prod
+| 2026-11-01T08:12:44Z INFO  starting api v1.18.2
+| 2026-11-01T08:12:44Z INFO  loading config from /etc/api/config.yaml
+| 2026-11-01T08:12:44Z ERROR failed to load config: required key "database_url" is empty
+| 2026-11-01T08:12:44Z FATAL exiting with code 78
+| user@host:~/ops/clusters$
