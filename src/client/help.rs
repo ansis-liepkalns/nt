@@ -29,7 +29,7 @@ fn lines(p: &str) -> Vec<String> {
     v.push("In the list:".into());
     v.push("RET attach · C-o new · C-k close".into());
     v.push("M-r rename · C-s search · M-i info".into());
-    v.push("M-s sort · C-g cancel".into());
+    v.push("M-s sort · M-D detach others · C-g cancel".into());
     v
 }
 

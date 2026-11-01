@@ -11,6 +11,7 @@ mod privacy;
 mod prompt;
 mod naming;
 mod resources;
+mod screen;
 mod session;
 mod shell;
 mod transcript;
@@ -43,10 +44,6 @@ type Master = Rc<AsyncFd<OwnedFd>>;
 const OUTBOX_LIMIT: usize = 2 << 20;
 /// Remote registrations expire after this long unused.
 const REG_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
-/// New transcript bytes needed before a session gets a new recap.
-const NAMER_MIN_NEW: u64 = 1024;
-/// Opening the switcher refreshes a summary after this much new output (a Ctrl-C'd build prints much less than 1 KiB).
-const NAMER_MIN_NEW_OPEN: u64 = 256;
 /// After a failed job (or batch) the session (or everything) is left alone for this long.
 const NAMER_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const NAMER_MAX_JOBS: usize = 4;
@@ -56,6 +53,8 @@ const RES_WATCHED: Duration = Duration::from_secs(2);
 const FIRST_CPU: Duration = Duration::from_millis(700);
 const RES_IDLE: Duration = Duration::from_secs(30);
 const STATUS_TICK: Duration = Duration::from_millis(250);
+/// How often screens are checked for activity / unread changes.
+const SCREEN_TICK: Duration = Duration::from_millis(500);
 const TRANSCRIPT_FLUSH: Duration = Duration::from_secs(3);
 
 /// Per-client outgoing queue with a bounded amount of queued terminal output.
@@ -130,9 +129,13 @@ struct Registration {
     last_input_seq: u64,
     /// Connection currently using this registration; a reconnect kicks it.
     active: Option<u64>,
+    /// The session it was last attached to, kept while its connection is down.
+    session: Option<SessionId>,
+    /// Detached from this session by another client (`DetachOthers`): a reconnect may not resume it.
+    evicted: Option<SessionId>,
 }
 
-/// What a running naming job was built from: transcript position, context, commands covered, unix time, branch.
+/// What a running naming job was built from: transcript position, context, commands covered, unix time, branch, screen, title.
 struct Inflight {
     mark: u64,
     ctx: String,
@@ -140,6 +143,9 @@ struct Inflight {
     asof: u64,
     running: bool,
     branch: String,
+    /// `Session::view_hash` of the input.
+    screen: u64,
+    title: String,
 }
 
 struct State {
@@ -155,7 +161,7 @@ struct State {
     /// When the last batch started / ended.
     namer_last: Option<Instant>,
     namer_ended: Option<Instant>,
-    /// Woken when a switcher opens: run a batch now if sessions are dirty.
+    /// Woken when a switcher opens: run a batch now if screens changed since their summaries.
     namer_kick: Rc<Notify>,
     /// A switcher opened while a batch was running (or more sessions were due than one batch holds):
     /// run another one as soon as this one ends.
@@ -194,7 +200,7 @@ impl State {
         let (mut id, mut key) = ([0u8; 16], [0u8; 32]);
         getrandom::fill(&mut id).expect("getrandom");
         getrandom::fill(&mut key).expect("getrandom");
-        self.regs.insert(id, Registration { key, last_used: Instant::now(), last_input_seq: 0, active: None });
+        self.regs.insert(id, Registration { key, last_used: Instant::now(), last_input_seq: 0, active: None, session: None, evicted: None });
         S2C::Registered { port: self.cfg.port, client_id: id, key }
     }
 
@@ -257,7 +263,6 @@ impl State {
             if old.iter().any(|(i, _)| i == id) && !old.contains(&(*id, key.clone()))
                 && let Some(s) = self.sessions.get_mut(id)
             {
-                s.dirty = true;
                 s.ctx_dirty = true;
             }
         }
@@ -391,24 +396,18 @@ impl State {
         let unix = now_unix();
         let mut cands: Vec<(namer::Cand, naming::Probe)> = Vec::new();
         for s in self.sessions.values() {
-            let new = s.tw.written().saturating_sub(s.recap_mark);
-            // A branch/group change is news by itself; otherwise there must be new output. The per-session backoff after a
-            // failed run does not hold back a switcher that was just opened.
-            if (new == 0 && !s.ctx_dirty) || (!eager && !force && s.backoff_until > unix) || s.exited {
-                continue;
-            }
-            // A rolling update needs something new to say.
-            if s.log.integrated && !s.summary.is_empty() && !s.ctx_dirty && !s.log.has_news(s.summary_seq) {
+            // News = the screen differs from the one the summary was made from, or the branch / group changed. The
+            // per-session backoff after a failed run does not hold back a switcher that was just opened.
+            let screen_changed = s.view_hash() != s.summary_screen;
+            if (!screen_changed && !s.ctx_dirty) || (!eager && !force && s.backoff_until > unix) || s.exited {
                 continue;
             }
             let Some(p) = naming::probe(s.master.as_ref().get_ref(), s.child.id()) else { continue };
-            let ctx_changed = s.recap_ctx.as_deref().is_some_and(|c| c != p.ctx) || s.ctx_dirty;
-            // Opening the switcher refreshes every session with any activity since its summary.
-            let min_new = if force { NAMER_MIN_NEW_OPEN } else { NAMER_MIN_NEW };
-            let stale = force && !s.summary.is_empty() && s.summary_stale();
-            let dirty = s.dirty || new >= min_new || ctx_changed || stale;
+            // In the background a changing screen (a build, an agent at work) is summarized once it has been still
+            // for a while; opening the switcher refreshes every changed session at once.
             let quiet = Duration::from_secs(unix.saturating_sub(s.last_active));
-            if eager || namer::session_ready(dirty, quiet, force) {
+            if eager || namer::session_ready(quiet, force) {
+                let new = s.tw.written().saturating_sub(s.recap_mark);
                 cands.push((namer::Cand { sid: s.id, new, last_used: s.last_used }, p));
             }
         }
@@ -445,29 +444,35 @@ impl State {
         let ident = privacy::Identity::current();
         let home = ident.home.clone();
         for (c, p) in cands {
-            let (new, sid) = (c.new, c.sid);
+            let sid = c.sid;
             let s = self.sessions.get_mut(&sid).unwrap();
             let mut header = shell::header(&p.cwd, &home);
             let branch = shell::branch_of(&p.cwd).unwrap_or_default();
             if !s.summary.is_empty() && s.summary_branch != branch {
                 // The topic describes what is going on NOW, so say what changed.
                 let (a, b) = (if s.summary_branch.is_empty() { "(none)" } else { &s.summary_branch }, if branch.is_empty() { "(none)" } else { &branch });
-                header.push_str(&format!("\nbranch changed since the earlier summary: {a} -> {b}"));
+                header.push_str(&format!("\nbranch changed since the older history: {a} -> {b}"));
             }
-            let fg = p.cmd.clone().unwrap_or_default();
+            let fg = s.log.running_cmd().map_or_else(|| p.cmd.clone().unwrap_or_default(), |c| c.cmd.clone());
+            // A new terminal title (an AI agent's or editor's next task) is a new activity: without the old summary,
+            // or a small model keeps describing the old one.
+            let new_task = !s.log.title.is_empty() && s.log.title != s.summary_title;
             // Live-state phrases of an older summary ("currently building") must not be carried forward.
-            let prev = (!s.summary.is_empty()).then(|| namer::drop_live_state(&s.summary, false).unwrap_or_else(|| s.summary.clone()));
-            let text = if s.log.integrated {
-                let fg = s.log.running_cmd().map_or(fg, |c| c.cmd.clone());
-                s.log.digest(&header, &fg, &home, unix, prev.as_deref().map(|p| (p, s.summary_seq)))
-            } else {
-                namer::guess_digest(&header, &s.tw.tail(new.min(8192) as usize), &fg, prev.as_deref())
-            };
+            let prev = (!s.summary.is_empty() && !new_task).then(|| namer::drop_live_state(&s.summary, false).unwrap_or_else(|| s.summary.clone()));
+            let contents = s.parser.screen().contents();
+            let text = screen::digest(&screen::Input {
+                earlier: prev.as_deref(),
+                header: &header,
+                title: &s.log.title,
+                foreground: &fg,
+                last_command: &s.log.last_command_line(),
+                screen: &contents,
+            });
             // The model never sees the home directory, the login name or the host name.
             let text = ident.scrub(&text);
-            s.dirty = false;
             s.ctx_dirty = false;
-            self.inflight.insert(sid, Inflight { mark: s.tw.written(), ctx: p.ctx.clone(), seq: s.log.covered_seq(), asof: unix, running: s.log.is_running(), branch });
+            let shot = s.view_hash();
+            self.inflight.insert(sid, Inflight { mark: s.tw.written(), ctx: p.ctx.clone(), seq: s.log.covered_seq(), asof: unix, running: s.log.is_running(), branch, screen: shot, title: s.log.title.clone() });
             jobs.push(namer::Job { sid, text });
         }
         if !jobs.is_empty() {
@@ -480,7 +485,7 @@ impl State {
     /// Apply one result of the running batch (`None`: the batch ended without a result for `sid`).
     /// Returns true if anything visible changed.
     fn apply_one(&mut self, sid: SessionId, out: Option<&namer::Out>) -> bool {
-        let Some(Inflight { mark, ctx, seq, asof, running: was_running, branch }) = self.inflight.remove(&sid) else { return false };
+        let Some(Inflight { mark, ctx, seq, asof, running: was_running, branch, screen, title }) = self.inflight.remove(&sid) else { return false };
         let Some(s) = self.sessions.get_mut(&sid) else { return false };
         let mut changed = true; // at least the pending marker goes away
         if out.is_some_and(|o| o.recap.is_some() || o.summary.is_some()) {
@@ -496,9 +501,10 @@ impl State {
                 s.summary_asof = asof;
                 s.summary_running = was_running;
                 s.summary_branch = branch;
+                s.summary_title = title;
             }
             s.recap_mark = mark;
-            s.recap_ctx = Some(ctx.clone());
+            s.summary_screen = screen;
         } else {
             s.backoff_until = now_unix() + NAMER_BACKOFF.as_secs();
         }
@@ -594,6 +600,7 @@ impl State {
             return None;
         }
         s.resize(cols, rows);
+        s.size_owner = Some(cid);
         s.last_active = now_unix();
         s.last_used = s.last_active;
         Some(s.master.clone())
@@ -615,8 +622,9 @@ fn home_dir() -> String {
 }
 
 /// Hidden debug command: `nt name-test <file>...` summarizes text files the way the namer does, in one batch
-/// (one model load, one prefix evaluation). A file that already is a digest (starts with `cwd:`; a leading
-/// `# gold:` line is dropped) is used as is. Prints name, topic, timings and peak RSS.
+/// (one model load, one prefix evaluation). A file that already is a digest (starts with `cwd:`, or `earlier summary:` in the older layout of `bench/scenarios`;
+/// `# gold:` lines are dropped) is used as is; anything else is terminal output, played into a 30x120 screen and
+/// digested like a live session's. Prints name, topic, timings and peak RSS.
 pub fn name_test(cfg: &Config, files: &[String], cwd: Option<&str>) -> Result<()> {
     if files.is_empty() {
         bail!("usage: nt name-test <file>...");
@@ -631,7 +639,10 @@ pub fn name_test(cfg: &Config, files: &[String], cwd: Option<&str>) -> Result<()
         let digest = if text.trim_start().starts_with("cwd:") || text.trim_start().starts_with("earlier summary:") {
             text + "\n"
         } else {
-            namer::guess_digest(&shell::header(Path::new(&cwd), &home), &text, "", None)
+            let mut p = vt100::Parser::new(30, 120, 0);
+            p.process(text.replace('\n', "\r\n").as_bytes());
+            let header = shell::header(Path::new(&cwd), &home);
+            screen::digest(&screen::Input { header: &header, screen: &p.screen().contents(), ..Default::default() })
         };
         let digest = privacy::Identity::current().scrub(&digest);
         eprintln!("[{i}] {f}\n{digest}");
@@ -776,6 +787,7 @@ async fn serve(cfg: Config, sock: &Path) -> Result<()> {
     spawn_local(transcript_flush_loop(st.clone()));
     spawn_local(status_loop(st.clone()));
     spawn_local(resource_loop(st.clone()));
+    spawn_local(screen_loop(st.clone()));
     let mut term = signal(SignalKind::terminate())?;
     loop {
         tokio::select! {
@@ -874,6 +886,25 @@ async fn status_loop(st: Shared) {
         tick.tick().await;
         let mut s = st.borrow_mut();
         if s.status_changed() {
+            s.broadcast_sessions();
+        }
+    }
+}
+
+/// Activity and unread marks: re-hash the screens that got output, every `SCREEN_TICK`.
+async fn screen_loop(st: Shared) {
+    let mut tick = tokio::time::interval(SCREEN_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let mut s = st.borrow_mut();
+        let now = Instant::now();
+        let shown: HashSet<SessionId> = s.clients.values().filter_map(|c| c.session).collect();
+        let mut changed = false;
+        for sess in s.sessions.values_mut() {
+            changed |= sess.check_screen(shown.contains(&sess.id), now);
+        }
+        if changed {
             s.broadcast_sessions();
         }
     }
@@ -1069,10 +1100,16 @@ async fn client_loop(rd: &mut FrameReader, st: &Shared, cid: u64) -> Result<()> 
                 let mut s = st.borrow_mut();
                 let c = s.clients.get_mut(&cid).unwrap();
                 (c.cols, c.rows) = (cols, rows);
-                if let Some(sid) = c.session
-                    && let Some(sess) = s.sessions.get_mut(&sid)
-                {
-                    sess.resize(cols, rows);
+                if let Some(sid) = c.session {
+                    // Only the client the session is sized for resizes it (or anyone, once that one is gone).
+                    let owner = s.sessions.get(&sid).and_then(|x| x.size_owner);
+                    let owner_here = owner.is_some_and(|o| o != cid && s.clients.get(&o).is_some_and(|c| c.session == Some(sid)));
+                    if let Some(sess) = s.sessions.get_mut(&sid)
+                        && !owner_here
+                    {
+                        sess.resize(cols, rows);
+                        sess.size_owner = Some(cid);
+                    }
                 }
             }
             C2S::Search { query } => {
@@ -1088,6 +1125,7 @@ async fn client_loop(rd: &mut FrameReader, st: &Shared, cid: u64) -> Result<()> 
                 st.borrow().send(cid, S2C::SearchResults(hits));
             }
             C2S::Rename { session, name } => rename(st, cid, session, &name),
+            C2S::DetachOthers { session } => detach_others(st, cid, session),
             C2S::Kill { session } => kill(st, cid, session),
             C2S::Respawn { session } => respawn(st, cid, session),
             C2S::Ping => {
@@ -1140,11 +1178,27 @@ fn attach(
             Err(e) => return s.send(cid, S2C::Error(format!("cannot start session: {e:#}"))),
         },
     };
+    // A client detached by another one may not come back by reconnecting; choosing the session again is fine.
+    let reg = s.clients[&cid].ident;
+    if let Some(r) = reg.and_then(|id| s.regs.get_mut(&id)) {
+        if resume_from.is_some() && r.evicted == Some(sid) {
+            return s.send(cid, S2C::Evicted);
+        }
+        r.evicted = None;
+        r.session = Some(sid);
+    }
     let c = s.clients.get_mut(&cid).unwrap();
     (c.session, c.cols, c.rows) = (Some(sid), cols, rows);
 
+    // The size follows the client that last used the session; a reconnect (e.g. a forgotten client on a laptop
+    // waking up) does not take it from a client that is attached.
+    let owner = s.sessions[&sid].size_owner;
+    let keep = resume_from.is_some() && owner.is_some_and(|o| o != cid && s.clients.get(&o).is_some_and(|c| c.session == Some(sid)));
     let sess = s.sessions.get_mut(&sid).unwrap();
-    sess.resize(cols, rows);
+    if !keep {
+        sess.resize(cols, rows);
+        sess.size_owner = Some(cid);
+    }
     sess.last_active = now_unix();
     sess.last_used = sess.last_active;
     s.send(cid, S2C::Attached { session: sid });
@@ -1157,7 +1211,41 @@ fn attach(
                 off += chunk.len() as u64;
             }
         }
-        None => s.send(cid, S2C::Redraw { offset: sess.ring.end(), data: sess.redraw() }),
+        None => {
+            let history = s.sessions.get_mut(&sid).unwrap().history();
+            let sess = &s.sessions[&sid];
+            s.send(cid, S2C::History(history));
+            s.send(cid, S2C::Redraw { offset: sess.ring.end(), data: sess.redraw() });
+        }
+    }
+    s.broadcast_sessions();
+}
+
+/// Detach every client but `cid` from `sid`. Connected ones get `Evicted` and quit; remote ones are also remembered,
+/// so one whose connection is dead right now does not resume the session when it reconnects.
+fn detach_others(st: &Shared, cid: u64, sid: SessionId) {
+    let mut s = st.borrow_mut();
+    let others: Vec<u64> = s.attached(sid).filter(|&o| o != cid).collect();
+    for o in others {
+        s.send(o, S2C::Evicted);
+        s.clients.get_mut(&o).unwrap().session = None;
+    }
+    // Remote clients on this session, connected or not, may not resume it.
+    let own = s.clients.get(&cid).and_then(|c| c.ident);
+    for (id, r) in s.regs.iter_mut() {
+        if r.session == Some(sid) && Some(*id) != own {
+            (r.session, r.evicted) = (None, Some(sid));
+        }
+    }
+    if let Some(sess) = s.sessions.get_mut(&sid) {
+        sess.size_owner = None;
+    }
+    // The remaining client's size applies now.
+    if let Some((cols, rows)) = s.clients.get(&cid).filter(|c| c.session == Some(sid)).map(|c| (c.cols, c.rows))
+        && let Some(sess) = s.sessions.get_mut(&sid)
+    {
+        sess.resize(cols, rows);
+        sess.size_owner = Some(cid);
     }
     s.broadcast_sessions();
 }

@@ -227,26 +227,6 @@ pub struct Cmd {
     pub errors: Vec<String>,
     /// Last non-empty output line.
     pub last: String,
-    /// Latest meaningful terminal title seen while it ran (decorative leading glyph removed), empty if none.
-    pub title: String,
-    /// Distinct titles seen, oldest first, the latest last (at most `MAX_TITLES`).
-    pub titles: Vec<String>,
-    /// Cursor-movement redraws / carriage-return overwrites vs. plain output lines: TUI output is noise.
-    pub noise: u32,
-    pub lines: u32,
-}
-
-const MAX_TITLES: usize = 5;
-/// Fewest redraws before output counts as TUI noise.
-const NOISE_MIN: u32 = 20;
-/// Titles that change within this many seconds do not mark the session dirty again.
-const TITLE_DEBOUNCE: u64 = 10;
-
-impl Cmd {
-    /// Mostly redraws (a TUI repainting in place), not a log of lines.
-    pub fn noisy(&self) -> bool {
-        self.noise >= NOISE_MIN && self.noise > self.lines
-    }
 }
 
 #[derive(Default)]
@@ -261,9 +241,6 @@ pub struct CommandLog {
     pub integrated: bool,
     /// Meaningful title of the program running now (empty: none; cleared when the command ends).
     pub title: String,
-    /// The latest meaningful title ever seen (kept after the command ends).
-    pub last_title: String,
-    title_at: u64,
 }
 
 impl CommandLog {
@@ -284,7 +261,7 @@ impl CommandLog {
 
     fn start(&mut self, cmd: String, now: u64) {
         self.total += 1;
-        self.entries.push_back(Cmd { seq: self.total, cmd, cwd: self.cwd.clone(), start: now, end: None, exit: None, errors: Vec::new(), last: String::new(), title: String::new(), titles: Vec::new(), noise: 0, lines: 0 });
+        self.entries.push_back(Cmd { seq: self.total, cmd, cwd: self.cwd.clone(), start: now, end: None, exit: None, errors: Vec::new(), last: String::new() });
         while self.entries.len() > MAX_ENTRIES {
             self.entries.pop_front();
         }
@@ -305,7 +282,7 @@ impl CommandLog {
         match ev {
             ShellEv::Cwd(p) => self.cwd = p,
             ShellEv::Title(t) => {
-                self.note_title(&t, None, "", now);
+                self.note_title(&t, None, "");
             }
             ShellEv::Prompt => {
                 self.integrated = true;
@@ -338,8 +315,8 @@ impl CommandLog {
 
     /// A title set by the program on the terminal. `shell_fg`: without shell integration, whether the shell itself is
     /// the foreground process (then it is the shell's default title). Returns true if it changed the title
-    /// meaningfully (not just the spinner glyph) and is not within the debounce window of the last such change.
-    pub fn note_title(&mut self, raw: &str, shell_fg: Option<bool>, home: &str, now: u64) -> bool {
+    /// meaningfully (not just the spinner glyph).
+    pub fn note_title(&mut self, raw: &str, shell_fg: Option<bool>, home: &str) -> bool {
         let raw = sanitize_title(raw);
         if (self.integrated && !self.running) || shell_fg == Some(true) {
             return false;
@@ -352,28 +329,8 @@ impl CommandLog {
         if text == self.title {
             return false;
         }
-        if let Some(c) = self.entries.back_mut().filter(|_| self.running) {
-            c.titles.retain(|t| *t != text);
-            c.titles.push(text.clone());
-            if c.titles.len() > MAX_TITLES {
-                c.titles.remove(0);
-            }
-            c.title = text.clone();
-        }
-        self.title = text.clone();
-        self.last_title = text;
-        let mark = self.title_at == 0 || now.saturating_sub(self.title_at) >= TITLE_DEBOUNCE;
-        if mark {
-            self.title_at = now;
-        }
-        mark
-    }
-
-    /// Redraw / overwrite count from the stripper since the last call (for the running command).
-    pub fn noise(&mut self, n: u32) {
-        if let Some(c) = self.entries.back_mut().filter(|_| self.running) {
-            c.noise = c.noise.saturating_add(n);
-        }
+        self.title = text;
+        true
     }
 
     /// An output line (only meaningful while a command runs).
@@ -382,7 +339,6 @@ impl CommandLog {
             return;
         }
         let Some(c) = self.entries.back_mut() else { return };
-        c.lines += 1;
         let t = text.trim();
         if t.is_empty() {
             return;
@@ -400,6 +356,18 @@ impl CommandLog {
 
     pub fn last_cmd(&self) -> Option<&Cmd> {
         self.entries.back()
+    }
+
+    /// The model's one line from the hooks: `running command: make -j8`, `last command: make -j8 · exit 2` or
+    /// `… · ok`. Empty without hooks or commands.
+    pub fn last_command_line(&self) -> String {
+        let Some(c) = self.entries.back().filter(|c| !c.cmd.is_empty()) else { return String::new() };
+        let cmd = clip(&c.cmd, 80);
+        match (c.end, c.exit) {
+            (None, _) => format!("running command: {cmd}"),
+            (Some(_), Some(x)) if x != 0 => format!("last command: {cmd} · exit {x}"),
+            (Some(_), _) => format!("last command: {cmd} · ok"),
+        }
     }
 }
 
@@ -464,7 +432,10 @@ impl CommandLog {
                 // The title says more than the redrawn output.
                 return (format!("⏵ {cmd}{title} · {{dur}}"), c.start);
             }
-            let tail = if i.partial.trim().is_empty() { c.last.as_str() } else { i.partial.trim() };
+            // A bare prompt sign (a nested `sh` waiting at `$ `) says nothing; show the last output line instead.
+            let partial = i.partial.trim();
+            let bare_prompt = !partial.is_empty() && partial.chars().all(|ch| "$#>%".contains(ch));
+            let tail = if partial.is_empty() || bare_prompt { c.last.as_str() } else { partial };
             let tail = if tail.is_empty() { String::new() } else { format!(" · {}", clip(tail, 80)) };
             return (format!("⏵ {cmd} · {{dur}}{tail}"), c.start);
         }
@@ -489,72 +460,6 @@ impl CommandLog {
         if self.title.is_empty() { String::new() } else { format!(" · {}", clip(&self.title, 60)) }
     }
 
-    // ------------------------------------------------------------ digest
-
-    /// The model input: optionally the previous summary, the header, recent commands (oldest first), the hosts
-    /// ssh'd into, the files opened in editors and the foreground command.
-    /// With `prev = Some((summary, seq))` only the commands newer than `seq` (and any still running) are listed
-    /// ("new commands since then"), else the whole log. At most `DIGEST_CMDS` commands, the newest ones.
-    pub fn digest(&self, header: &str, fg: &str, home: &str, now: u64, prev: Option<(&str, u64)>) -> String {
-        let since = prev.map_or(0, |p| p.1);
-        let all: Vec<&Cmd> = self.entries.iter().filter(|c| !c.cmd.is_empty() && (c.seq > since || c.end.is_none())).collect();
-        let rows = &all[all.len().saturating_sub(DIGEST_CMDS)..];
-        let w = rows.iter().map(|c| clip(&c.cmd, 40).chars().count()).max().unwrap_or(0);
-        let mut out = String::new();
-        if let Some((sum, _)) = prev {
-            out.push_str(&format!("earlier summary: {}\n", sum.trim()));
-        }
-        out.push_str(&format!("{header}\n{}\n", if prev.is_some() { "new commands since then (oldest first):" } else { "commands (oldest first):" }));
-        for c in rows {
-            let (st, dur) = match (c.end, c.exit) {
-                (None, _) => ("running".to_string(), now.saturating_sub(c.start)),
-                (Some(e), Some(x)) if x != 0 => (format!("exit {x}"), e.saturating_sub(c.start)),
-                (Some(e), _) => ("ok".to_string(), e.saturating_sub(c.start)),
-            };
-            let cwd = tilde(&c.cwd, home);
-            let mut line = format!("  [{cwd}] {:<w$} {st:<8} {}", clip(&c.cmd, 40), short_dur(dur));
-            if !c.title.is_empty() {
-                line.push_str(&format!("  title: \"{}\"", clip(&c.title, 100)));
-                let earlier: Vec<String> =
-                    c.titles.iter().rev().filter(|t| **t != c.title).take(2).map(|t| format!("\"{}\"", clip(t, 60))).collect();
-                if !earlier.is_empty() {
-                    line.push_str(&format!(" (earlier: {})", earlier.join(", ")));
-                }
-            }
-            // TUI redraws are noise: rely on the title, drop the output lines.
-            let tui = c.noisy();
-            if tui {
-                line.push_str(if c.title.is_empty() { "  (interactive full-screen output omitted)" } else { "  (interactive TUI, output omitted)" });
-            }
-            out.push_str(&line);
-            out.push('\n');
-            let notes: Vec<&String> = if tui {
-                vec![]
-            } else if c.end.is_none() || c.exit.is_none_or(|x| x == 0) {
-                if c.end.is_none() && !c.last.is_empty() { vec![&c.last] } else { vec![] }
-            } else if c.errors.is_empty() {
-                if c.last.is_empty() { vec![] } else { vec![&c.last] }
-            } else {
-                c.errors.iter().take(2).collect()
-            };
-            for n in notes {
-                out.push_str(&format!("      | {}\n", clip(n, 100)));
-            }
-        }
-        let cmds: Vec<&str> = rows.iter().map(|c| c.cmd.as_str()).collect();
-        let (hosts, files) = (ssh_hosts(&cmds), edited_files(&cmds));
-        if !hosts.is_empty() {
-            out.push_str(&format!("hosts: {}\n", hosts.join(", ")));
-        }
-        if !files.is_empty() {
-            out.push_str(&format!("files: {}\n", files.join(", ")));
-        }
-        if !fg.is_empty() {
-            out.push_str(&format!("foreground: {fg}\n"));
-        }
-        out
-    }
-
     /// The `seq` a summary made now covers: everything before the oldest command still running (that one is
     /// listed again next time, with its result).
     pub fn covered_seq(&self) -> u64 {
@@ -566,70 +471,6 @@ impl CommandLog {
     pub fn activity_since(&self, seq: u64, running: bool) -> bool {
         let seen = seq + u64::from(running);
         self.entries.iter().any(|c| !c.cmd.is_empty() && (c.seq > seen || (running && c.seq == seen && c.end.is_some())))
-    }
-
-    /// Whether `digest(.., prev)` would list anything new (a job without new activity is not worth a model call).
-    pub fn has_news(&self, since: u64) -> bool {
-        self.entries.iter().any(|c| !c.cmd.is_empty() && (c.seq > since || c.end.is_none()))
-    }
-}
-
-/// Most commands in a digest.
-pub const DIGEST_CMDS: usize = 12;
-
-/// Hosts of the `ssh` commands, in order, without repeats (at most 4).
-fn ssh_hosts(cmds: &[&str]) -> Vec<String> {
-    // ssh options that take a value
-    const WITH_ARG: &str = "bcDEeFIiJLlmOopQRSWw";
-    let mut out: Vec<String> = Vec::new();
-    for c in cmds {
-        let mut it = c.split_whitespace().skip_while(|w| *w == "sudo");
-        if it.next().is_none_or(|w| w.rsplit('/').next() != Some("ssh")) {
-            continue;
-        }
-        while let Some(a) = it.next() {
-            if let Some(f) = a.strip_prefix('-') {
-                // `-p 22` takes the next word, `-vp 22` likewise; `-p22` and `-oX=y` carry their value.
-                if let Some(i) = f.find(|c| WITH_ARG.contains(c))
-                    && i + 1 == f.len()
-                {
-                    it.next();
-                }
-            } else {
-                let host = clip(a, 40);
-                if !out.contains(&host) && out.len() < 4 {
-                    out.push(host);
-                }
-                break;
-            }
-        }
-    }
-    out
-}
-
-/// Files named by editor commands (`vim a.rs b.rs`), in order, without repeats (at most 4).
-fn edited_files(cmds: &[&str]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for c in cmds {
-        let mut it = c.split_whitespace().skip_while(|w| *w == "sudo" || *w == "sudoedit");
-        if !it.next().is_some_and(is_editor) {
-            continue;
-        }
-        for a in it.filter(|a| !a.starts_with(['-', '+'])) {
-            let f = clip(a, 60);
-            if !out.contains(&f) && out.len() < 4 {
-                out.push(f);
-            }
-        }
-    }
-    out
-}
-
-pub fn short_dur(s: u64) -> String {
-    match s {
-        0..=59 => format!("{s}s"),
-        60..=3599 => format!("{}m", s / 60),
-        _ => format!("{}h", s / 3600),
     }
 }
 
@@ -798,65 +639,19 @@ mod tests {
     }
 
     #[test]
-    fn digest_format() {
+    fn last_command_line_for_the_model() {
         let mut log = CommandLog::default();
+        assert_eq!(log.last_command_line(), "");
         log.apply(ShellEv::Cwd("/home/u/src/nt".into()), 0);
         run(&mut log, "cargo build", 0, 12, 0, &["ok"]);
-        run(&mut log, "cargo test", 20, 60, 101, &["error[E0308]: mismatched types --> src/proto.rs:88"]);
+        assert_eq!(log.last_command_line(), "last command: cargo build · ok");
+        run(&mut log, "cargo test", 20, 60, 101, &["error[E0308]: mismatched types"]);
+        assert_eq!(log.last_command_line(), "last command: cargo test · exit 101");
         log.apply(ShellEv::CmdLine("make deploy".into()), 100);
         log.apply(ShellEv::OutputStart, 100);
-        log.line("Uploading 45%");
-        let hdr = "cwd: ~/src/nt (git nt, branch reconnect)";
-        let d = log.digest(hdr, "make deploy", "/home/u", 280, None);
-        let want = [
-            "cwd: ~/src/nt (git nt, branch reconnect)",
-            "commands (oldest first):",
-            "  [~/src/nt] cargo build ok       12s",
-            "  [~/src/nt] cargo test  exit 101 40s",
-            "      | error[E0308]: mismatched types --> src/proto.rs:88",
-            "  [~/src/nt] make deploy running  3m",
-            "      | Uploading 45%",
-            "foreground: make deploy",
-            "",
-        ];
-        assert_eq!(d, want.join("\n"));
-
-        // Rolling: the summary made after `cargo test` (seq 2) covers the first two commands; the running
-        // `make deploy` is listed again, together with the commands that came after.
+        assert_eq!(log.last_command_line(), "running command: make deploy");
+        // A summary made now covers the two finished commands; the running one is listed again next time.
         assert_eq!((log.total(), log.covered_seq()), (3, 2));
-        log.apply(ShellEv::Done(Some(0)), 290);
-        run(&mut log, "ssh -p 2222 deploy@web02", 300, 310, 0, &[]);
-        run(&mut log, "sudo vim /etc/nginx/nginx.conf ~/notes.md", 320, 330, 0, &[]);
-        let d = log.digest(hdr, "", "/home/u", 340, Some(("Built nt.  Tests failed.", 2)));
-        let want = [
-            "earlier summary: Built nt.  Tests failed.",
-            hdr,
-            "new commands since then (oldest first):",
-            "  [~/src/nt] make deploy                              ok       3m",
-            "  [~/src/nt] ssh -p 2222 deploy@web02                 ok       10s",
-            "  [~/src/nt] sudo vim /etc/nginx/nginx.conf ~/notes.m ok       10s",
-            "hosts: deploy@web02",
-            "files: /etc/nginx/nginx.conf, ~/notes.md",
-            "",
-        ];
-        assert_eq!(d, want.join("\n"));
-        assert!(log.has_news(2) && !log.has_news(log.total()));
-    }
-
-    #[test]
-    fn rolling_digest_is_bounded_and_skips_old_commands() {
-        let mut log = CommandLog::default();
-        for i in 0..20 {
-            run(&mut log, &format!("cmd{i}"), i, i + 1, 0, &[]);
-        }
-        let d = log.digest("cwd: /", "", "/home", 100, None);
-        assert_eq!(d.lines().filter(|l| l.starts_with("  [")).count(), DIGEST_CMDS);
-        assert!(d.contains("cmd19") && d.contains("cmd8 ") && !d.contains("cmd7 "));
-        let d = log.digest("cwd: /", "", "/home", 100, Some(("S", 18)));
-        assert!(d.starts_with("earlier summary: S\ncwd: /\nnew commands since then") && d.contains("cmd19") && d.contains("cmd18") && !d.contains("cmd17"));
-        assert!(!log.has_news(20) && log.has_news(19));
-        assert_eq!(ssh_hosts(&["ssh -i key host1", "ls", "ssh host1", "/usr/bin/ssh -vp 22 u@h2 uptime"]), vec!["host1", "u@h2"]);
-        assert_eq!(edited_files(&["vim -R +10 a.rs", "emacs b.c a.rs", "cat x"]), vec!["a.rs", "b.c"]);
     }
 
     #[test]
@@ -893,75 +688,70 @@ mod tests {
         let mut log = CommandLog::default();
         log.apply(ShellEv::Prompt, 1);
         // between D and the next command: the shell's own title
-        assert!(!log.note_title("✳ Fix reconnect bug", None, h, 2));
+        assert!(!log.note_title("✳ Fix reconnect bug", None, h));
         assert!(log.title.is_empty());
         log.apply(ShellEv::CmdLine("claude".into()), 3);
         log.apply(ShellEv::OutputStart, 3);
-        assert!(!log.note_title("u@box: ~", None, h, 3));
-        assert!(log.note_title("✳ Fix reconnect bug", None, h, 4));
-        assert_eq!(log.running_cmd().unwrap().title, "Fix reconnect bug");
+        assert!(!log.note_title("u@box: ~", None, h));
+        assert!(log.note_title("✳ Fix reconnect bug", None, h));
+        assert_eq!(log.title, "Fix reconnect bug");
         log.apply(ShellEv::Done(Some(0)), 5);
         assert!(log.title.is_empty());
-        assert_eq!(log.last_cmd().unwrap().title, "Fix reconnect bug");
         // no integration: ignored while the shell is foreground
         let mut bare = CommandLog::default();
-        assert!(!bare.note_title("u@box: ~", Some(true), h, 1));
-        assert!(!bare.note_title("Fix it", Some(true), h, 1));
-        assert!(bare.note_title("Fix it", Some(false), h, 1));
+        assert!(!bare.note_title("u@box: ~", Some(true), h));
+        assert!(!bare.note_title("Fix it", Some(true), h));
+        assert!(bare.note_title("Fix it", Some(false), h));
     }
 
     #[test]
-    fn spinner_churn_does_not_mark_dirty() {
+    fn spinner_churn_is_not_a_title_change() {
         let mut log = CommandLog::default();
         log.apply(ShellEv::CmdLine("claude".into()), 100);
         log.apply(ShellEv::OutputStart, 100);
-        assert!(log.note_title("✳ Fix reconnect bug", None, "", 100));
-        for (i, g) in ["⠂", "⠐", "✳", "·", "*"].iter().enumerate() {
-            assert!(!log.note_title(&format!("{g} Fix reconnect bug"), None, "", 101 + i as u64));
+        assert!(log.note_title("✳ Fix reconnect bug", None, ""));
+        for g in ["⠂", "⠐", "✳", "·", "*"] {
+            assert!(!log.note_title(&format!("{g} Fix reconnect bug"), None, ""));
         }
-        // a real change inside the debounce window is stored but does not re-mark
-        assert!(!log.note_title("✳ Add tests", None, "", 106));
+        assert!(log.note_title("✳ Add tests", None, ""));
         assert_eq!(log.title, "Add tests");
-        assert!(log.note_title("✳ Fix lint", None, "", 120));
-        let c = log.running_cmd().unwrap();
-        assert_eq!(c.titles, ["Fix reconnect bug", "Add tests", "Fix lint"]);
         assert_eq!(title_text("/usr/bin x"), "/usr/bin x");
         assert_eq!(title_text("⠂ x y"), "x y");
     }
 
     #[test]
-    fn status_and_digest_with_title() {
+    fn status_with_title() {
         let mut log = CommandLog::default();
         log.apply(ShellEv::Cwd("/home/u/src/nt".into()), 1);
         log.apply(ShellEv::CmdLine("claude".into()), 100);
         log.apply(ShellEv::OutputStart, 100);
-        log.note_title("Explore repo", None, "/home/u", 101);
-        log.note_title("✳ Fix reconnect bug in proto.rs", None, "/home/u", 200);
+        log.note_title("Explore repo", None, "/home/u");
+        log.note_title("✳ Fix reconnect bug in proto.rs", None, "/home/u");
         log.line("some redrawn line");
-        log.noise(200);
         assert_eq!(log.status(&si()), ("⏵ claude · Fix reconnect bug in proto.rs · {dur}".to_string(), 100));
         let st = StatusIn { alt: true, fg_cmd: "claude", fg_is_shell: false, ..si() };
         assert_eq!(log.status(&st).0, "⏵ claude · Fix reconnect bug in proto.rs");
-        let d = log.digest("cwd: ~/src/nt", "claude", "/home/u", 820, None);
-        assert!(d.contains("title: \"Fix reconnect bug in proto.rs\" (earlier: \"Explore repo\")"), "{d}");
-        assert!(d.contains("output omitted") && !d.contains("some redrawn line"), "{d}");
-        // plain output keeps its notes
-        let mut plain = CommandLog::default();
-        plain.apply(ShellEv::CmdLine("make".into()), 1);
-        plain.apply(ShellEv::OutputStart, 1);
-        plain.line("building");
-        assert!(plain.digest("cwd: /", "make", "", 5, None).contains("| building"));
         // vim
         let mut v = CommandLog::default();
         v.apply(ShellEv::CmdLine("vim README.md".into()), 1);
         v.apply(ShellEv::OutputStart, 1);
-        v.note_title("README.md", None, "", 1);
+        v.note_title("README.md", None, "");
         let st = StatusIn { alt: true, fg_cmd: "vim", fg_is_shell: false, ..si() };
         assert_eq!(v.status(&st).0, "✎ vim README.md · README.md");
         // without hooks
         let mut b = CommandLog::default();
-        b.note_title("Fix it", Some(false), "", 1);
+        b.note_title("Fix it", Some(false), "");
         let st = StatusIn { fg_cmd: "claude", fg_is_shell: false, ..si() };
         assert_eq!(b.status(&st).0, "⏵ claude · Fix it");
+    }
+
+    #[test]
+    fn nested_shell_prompt_is_not_the_status() {
+        let mut log = CommandLog::default();
+        log.apply(ShellEv::CmdLine("cd src && sh".into()), 100);
+        log.apply(ShellEv::OutputStart, 100);
+        log.line("build ok");
+        assert_eq!(log.status(&StatusIn { partial: "$ ", ..si() }).0, "⏵ cd src && sh · {dur} · build ok");
+        assert_eq!(log.status(&StatusIn { partial: "Password: ", ..si() }).0, "⏵ cd src && sh · {dur} · Password:");
     }
 }

@@ -55,7 +55,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             prefix: 0x1d,
-            scrollback: 1000,
+            scrollback: 5000,
             port: 4022,
             llm: if cfg!(feature = "llm") { LlmMode::Local } else { LlmMode::Off },
             llm_model: DEFAULT_LLM_MODEL.into(),

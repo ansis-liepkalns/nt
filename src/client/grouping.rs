@@ -131,6 +131,8 @@ mod tests {
             branch: String::new(),
             summary_unix: 0,
             summary_stale: false,
+            active: false,
+            unread: false,
             group: g.cloned(),
         }
     }

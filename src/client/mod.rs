@@ -23,7 +23,7 @@ use remote::{open_link, Connector, Inbox, Target};
 use switcher::{fit, parse_keys, Action, Key, LineEditor, Switcher};
 
 /// Shown on the bottom row while the attached session's shell is gone.
-const EXIT_BAR: &str = "shell exited · RET new shell · C-k close";
+const EXIT_BAR: &str = "shell exited · RET new shell · C-k close & quit";
 const PING_EVERY: Duration = Duration::from_secs(5);
 const DEAD_AFTER: Duration = Duration::from_secs(15);
 
@@ -80,6 +80,10 @@ struct Client {
     /// painted on it, or it still holds another session). Entering the alternate screen would save that junk and the
     /// application's `?1049l` would bring it back, so it is cleared first and repainted from the mirror on alt -> main.
     main_stale: bool,
+    /// Some session was shown in this run: the real terminal's scrollback holds its lines.
+    shown_any: bool,
+    /// The next `History` replaces the terminal's scrollback (a switch), rather than adding to it (the first attach).
+    history_clear: bool,
     /// Test hook: collect the terminal output here instead of writing to stdout.
     capture: Option<Vec<u8>>,
     /// Show the one-time key tip (config `tips`).
@@ -307,6 +311,8 @@ async fn session(cfg: &Config, opts: Opts) -> Result<String> {
         naming_paused: String::new(),
         real_alt: false,
         main_stale: false,
+        shown_any: false,
+        history_clear: false,
         capture: None,
         tips: cfg.tips,
         help: false,
@@ -314,18 +320,19 @@ async fn session(cfg: &Config, opts: Opts) -> Result<String> {
     };
     let inbox = link.inbox;
 
-    // `nt` starts a new session; `nt -s` opens the list (a new session directly when there is none).
-    let target = if opts.switcher && !c.sessions.is_empty() {
+    // `nt` starts a new session; `nt -s` opens the list, or says there is nothing to list.
+    if opts.switcher {
+        if c.sessions.is_empty() {
+            return Ok("no sessions (start one with `nt`)".into());
+        }
         let _guard = TermGuard::new()?;
         connector.raw = true;
         c.open_switcher();
         return interactive(c, inbox, connector).await;
-    } else {
-        None
-    };
+    }
     let _guard = TermGuard::new()?;
     connector.raw = true;
-    c.attach(target).await?;
+    c.attach(None).await?;
     interactive(c, inbox, connector).await
 }
 
@@ -414,7 +421,7 @@ const SPIN_EVERY: Duration = Duration::from_millis(125);
 
 impl Client {
     fn spinning(&self) -> bool {
-        matches!(&self.mode, Mode::Switcher(sw) if sw.any_pending())
+        matches!(&self.mode, Mode::Switcher(sw) if sw.animating())
     }
 
     fn spin_frame(&mut self) {
@@ -586,10 +593,11 @@ impl Client {
                         }
                     }
                     ExitedKey::Close => {
-                        // The exit itself was the first step: no y/n.
+                        // The exit itself was the first step: no y/n. Like `exit` in a plain terminal, this ends the client too.
                         if let Some(session) = self.cur {
                             self.send(C2S::Kill { session }).await?;
                         }
+                        self.quit = Some("session closed".into());
                         return Ok(data.len());
                     }
                     ExitedKey::Ignore => {}
@@ -632,6 +640,7 @@ impl Client {
                 if let Some(id) = self.cur {
                     if self.cur_exited() {
                         self.send(C2S::Kill { session: id }).await?;
+                        self.quit = Some("session closed".into());
                     } else {
                         self.mode = Mode::ConfirmClose(id);
                         self.draw_overlay();
@@ -707,6 +716,7 @@ impl Client {
             Action::New => self.attach(None).await?,
             Action::Rename(session, name) => self.send(C2S::Rename { session, name }).await?,
             Action::Kill(session) => self.send(C2S::Kill { session }).await?,
+            Action::DetachOthers(session) => self.send(C2S::DetachOthers { session }).await?,
             Action::Help => self.show_help(),
             Action::Detach => {
                 self.send(C2S::Detach).await?;
@@ -733,6 +743,8 @@ impl Client {
             }
             S2C::Attached { session } => {
                 if self.cur != Some(session) {
+                    self.history_clear = self.shown_any;
+                    self.shown_any = true;
                     self.last = self.cur;
                     // The main screen holds the previous session (or the switcher).
                     self.main_stale = true;
@@ -755,6 +767,7 @@ impl Client {
                     }
                 }
             }
+            S2C::History(data) => self.put_history(&data),
             S2C::Redraw { offset, data } => {
                 self.out_off = offset;
                 self.mirror = vt100::Parser::new(self.rows, self.cols, 0);
@@ -779,6 +792,7 @@ impl Client {
                 }
             }
             S2C::Error(e) => self.status(&e),
+            S2C::Evicted => self.quit = Some("detached: another client took the session over".into()),
             S2C::Ack { last_input_seq } => self.ack(last_input_seq),
             S2C::SearchResults(hits) => {
                 if let Mode::Switcher(sw) = &mut self.mode {
@@ -856,6 +870,34 @@ impl Client {
         if self.cur_exited() && matches!(self.mode, Mode::Pass) {
             self.status(EXIT_BAR);
         }
+    }
+
+    /// Put the attached session's scrollback into the real terminal's: scrolling up then shows this session's past
+    /// (a long `claude` conversation, say), not whatever the terminal showed before. On a switch from another session
+    /// the terminal's scrollback is cleared first (it held that session's lines). The `Redraw` that follows paints
+    /// the screen.
+    fn put_history(&mut self, data: &[u8]) {
+        let switched = std::mem::take(&mut self.history_clear);
+        if data.is_empty() && !switched {
+            return;
+        }
+        let mut out = Vec::new();
+        if self.real_alt {
+            out.extend_from_slice(b"\x1b[?1049l");
+            self.real_alt = false;
+        }
+        out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
+        if switched {
+            out.extend_from_slice(b"\x1b[3J");
+        }
+        out.extend_from_slice(data);
+        // Scroll the last lines off the screen too, so the repaint does not overwrite them. The cursor sits on the empty
+        // row after them: `rows - 1` line feeds push exactly the history rows above it into the scrollback.
+        if !data.is_empty() {
+            out.extend(std::iter::repeat_n(b'\n', (self.rows as usize).saturating_sub(1)));
+        }
+        self.main_stale = true;
+        self.emit(&out);
     }
 
     /// The attached session's shell has exited.
@@ -1022,6 +1064,8 @@ mod tests {
             naming_paused: String::new(),
         real_alt: false,
             main_stale: false,
+            shown_any: false,
+            history_clear: false,
             capture: Some(Vec::new()),
             tips: false,
             help: false,
@@ -1136,6 +1180,8 @@ mod tests {
             branch: String::new(),
             summary_unix: 0,
             summary_stale: false,
+            active: false,
+            unread: false,
             group: None,
         };
         h.c.sessions = vec![info(1, "/srv/app"), info(2, "/var/log")];
@@ -1281,7 +1327,7 @@ mod tests {
         assert_eq!(exited_key(b"\x1bj", 0), ExitedKey::Ignore);
         assert_eq!(exited_key(b"k", 0), ExitedKey::Ignore);
         assert_eq!(exited_key(b"y", 0), ExitedKey::Ignore);
-        assert!(EXIT_BAR.ends_with("RET new shell · C-k close"));
+        assert!(EXIT_BAR.ends_with("RET new shell · C-k close & quit"));
     }
 
     #[test]
@@ -1319,6 +1365,8 @@ mod tests {
             branch: String::new(),
             summary_unix: 0,
             summary_stale: false,
+            active: false,
+            unread: false,
             group: None,
         };
         let line = ls_entry(&s, 100);
@@ -1354,6 +1402,8 @@ mod tests {
             branch: String::new(),
             summary_unix: 0,
             summary_stale: false,
+            active: false,
+            unread: false,
             group,
         };
         let web = g("/h/web", "web", "~/web");

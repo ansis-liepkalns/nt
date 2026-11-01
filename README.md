@@ -16,6 +16,7 @@ network loss, laptop sleep and roaming; the client reconnects on its own and pic
   (`✓ cargo build · 2m ago`), CPU/RAM bars, a short topic and a searchable summary of what was done.
 - **Multiple clients** can attach to one session.
 - **Native scrollback**: output goes to your terminal emulator as is, so its scrollbar, search and selection keep working.
+  Switching sessions replaces the terminal's scrollback with that session's (the server keeps 5000 lines per session).
 - **No panes or windows**: your terminal emulator does that. Emacs-style keys; works in an 80x24 terminal.
 
 ## Why nt?
@@ -68,7 +69,7 @@ server sends.
 ```
 nt                   # start a new session locally; the daemon starts on demand
 nt myserver          # start a new session on myserver: ssh bootstraps the daemon, then nt connects directly over TCP
-nt -s [myserver]     # open the session list (with no sessions, a new one is started)
+nt -s [myserver]     # open the session list (with no sessions, says so and exits)
 nt ls [myserver]     # print sessions grouped by project folder, one line each: id, name, status, topic
 nt restart [myserver]  # restart the nt server after an upgrade (ends its sessions)
 nt --help | --version
@@ -103,7 +104,9 @@ session between them. `nt ls` prints the same grouping. Typing a group's name in
 
 The list works like alt-tab: the current session is first (marked `*`), then the others by most recent use (attach or typing),
 sessions whose shell has exited last. The current session is preselected (`RET` just closes the switcher); `C-] l` jumps to the last session you were in. The order is fixed when the switcher opens: live updates (status, topic, CPU) change what is shown, never where it is,
-and new sessions are added at the end. The selected entry has an accent `▌` marker in the left column (`>` with `NT_ASCII=1`) and a
+and new sessions are added at the end. In front of the id, a spinner means the session's screen is changing right now
+(a build, an agent at work) and `●` means it changed since any nt client last showed it: there is output you have not seen.
+Attaching clears the dot. The selected entry has an accent `▌` marker in the left column (`>` with `NT_ASCII=1`) and a
 bold name; other entries' topics are dim. Typing filters (best match first, recency breaks ties): matches id, name, command, cwd, topic and summary, then
 
 | keys | action |
@@ -114,6 +117,7 @@ bold name; other entries' topics are dim. Typing filters (best match first, rece
 | `C-o` or `M-RET` | new session |
 | `M-r` | rename (RET confirm, C-g cancel, empty = automatic name) |
 | `C-k` | close the selected session (y/n; at once if its shell has exited) when the cursor is at the end of the filter text, otherwise kill-line. `M-k` always closes |
+| `M-D` | detach the selected session's other clients (e.g. a forgotten one elsewhere with a different window size); offered when there are any |
 | `M-i` | show / hide the summary of the selected session under the list (needs a terminal of 20+ rows) |
 | `M-s` | cycle sort: recent use (default), CPU, RAM |
 | `C-s` | toggle full-text search over session transcripts and summaries |
@@ -121,8 +125,8 @@ bold name; other entries' topics are dim. Typing filters (best match first, rece
 | `C-] d` or `C-x C-c` | detach (exit the client; the session keeps running) |
 
 The filter line takes `C-a C-e C-b C-f C-d C-h M-b M-f C-w M-d C-k C-u` (`C-k` as above). When a shell exits the session stays, showing
-`shell exited · RET new shell · C-k close` on the bottom row: `RET` starts a new shell in the same directory, `C-k` (or `M-k`) closes the session
-at once, without y/n (the exit was the first step). Set `NT_ASCII=1` for ASCII-only drawing.
+`shell exited · RET new shell · C-k close & quit` on the bottom row: `RET` starts a new shell in the same directory, `C-k` (or `M-k`) closes
+the session at once, without y/n (the exit was the first step), and quits the client like `exit` in a plain terminal. Set `NT_ASCII=1` for ASCII-only drawing.
 
 ## Shell integration
 nt starts bash, zsh and fish sessions with a small hook (OSC 133 / OSC 7 prompt marks) that reports commands, exit codes and the
@@ -146,17 +150,18 @@ foreground command and git repo or directory; the LLM refines name and topic. A 
   Any GGUF that llama.cpp supports works, as a URL or a local path. See `bench/RESULTS.md` for how these were chosen.
 - **API backend** (`llm = "api"`): any OpenAI-compatible chat completions endpoint (`llm_api_url`, `llm_api_model`, key from the
   environment variable `llm_api_key_env` or the file `llm_api_key_file`). Needs an API key with billing; a ChatGPT subscription
-  does not include API access. The command digest (cwd, repo, branch, recent commands with status and a few output lines) is sent
+  does not include API access. The model input (cwd, repo, branch, terminal title, last command and the text on the screen) is sent
   to the provider after masking likely secrets (`key=value` pairs with secret-looking keys, bearer tokens, `--password` flags,
   URL credentials, long hex/base64 runs, well-known token prefixes). Masking is best effort. Use `local` or `off` if your
-  terminals may show sensitive data. Whatever the backend, the digest never contains your home directory path (shown as `~`), your
+  terminals may show sensitive data. Whatever the backend, the input never contains your home directory path (shown as `~`), your
   login name (`user`) or the short host name (`host`).
 - **`llm = "off"`**: heuristic names and no topic; the status line still works.
 
 ### When it runs
-A session becomes *dirty* when a command ends, its directory changes, you `ssh` somewhere, or it wrote 1 KiB of new output. In the
-background a batch runs when a session is dirty and has been quiet for 20 s, at most one batch per 2 minutes. Opening the switcher
-runs a batch at once if anything is dirty (unless the last one ended less than 30 s ago); results appear in the open switcher as
+The model reads what you would see: the session's screen, its terminal title, directory and branch (and, from the shell hooks, the
+last command's exit status). So it works the same in a plain shell, inside `docker exec` or `ssh`, in an editor or with an AI agent.
+A session is summarized again when its screen or title changed since its last summary. In the background a batch runs when such a
+session has been quiet for 20 s, at most one batch per 2 minutes. Opening the switcher refreshes every changed session at once; results appear in the open switcher as
 they arrive, and a dim `…` after a topic marks a session being updated. If naming fails, the switcher title shows
 `naming: error, see server.log` and `nt ls` prints the error; it retries after 5 minutes.
 

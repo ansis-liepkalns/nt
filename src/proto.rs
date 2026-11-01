@@ -6,7 +6,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTO_VERSION: u32 = 7;
+pub const PROTO_VERSION: u32 = 8;
 pub const MAX_FRAME: usize = 1 << 20;
 
 pub type SessionId = u32;
@@ -71,6 +71,10 @@ pub struct SessionInfo {
     pub summary_unix: u64,
     /// Something happened since the summary was made (a command ended, the branch or directory changed, new output).
     pub summary_stale: bool,
+    /// The screen changed in the last couple of seconds (output is arriving: a build, an agent at work).
+    pub active: bool,
+    /// The screen changed since a client last showed it.
+    pub unread: bool,
 }
 
 /// Compact elapsed time: `45s`, `3m12s`, `1h05m`.
@@ -136,6 +140,8 @@ pub enum C2S {
     Respawn { session: SessionId },
     /// The switcher is open (true) or closed (false): resource usage is sampled faster while watched.
     Watch(bool),
+    /// Detach every other client from this session (they quit, and a reconnect does not bring them back).
+    DetachOthers { session: SessionId },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -147,6 +153,9 @@ pub enum S2C {
     Attached { session: SessionId },
     /// `offset` = absolute position of `data[0]` in the session stream.
     Output { offset: u64, data: Vec<u8> },
+    /// Sent before the `Redraw` of a fresh attach: the session's scrollback (lines that scrolled off the main screen,
+    /// oldest first, each ending in CRLF), for the client to put into the real terminal's scrollback.
+    History(Vec<u8>),
     /// Full repaint; the stream continues at `offset`.
     Redraw { offset: u64, data: Vec<u8> },
     SessionEnded { session: SessionId },
@@ -162,6 +171,8 @@ pub enum S2C {
     NamerError(String),
     /// Why naming is paused right now (`battery`, `low memory`, `memory pressure`; empty = not paused); sent like `NamerError`.
     NamerPaused(String),
+    /// Another client took this session over (`DetachOthers`): quit.
+    Evicted,
 }
 
 

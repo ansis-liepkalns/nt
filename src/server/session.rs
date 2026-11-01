@@ -82,10 +82,8 @@ pub struct Session {
     pub summary_seq: u64,
     /// Transcript position (`Transcript::written`) the recap was made at.
     pub recap_mark: u64,
-    /// Repo/dir context at the last recap, to notice cwd changes.
-    pub recap_ctx: Option<String>,
-    /// Something worth re-summarizing happened (command end, cwd change, ssh) since the last namer job.
-    pub dirty: bool,
+    /// `view_hash` of what the summary was made from: a different one is news for the namer.
+    pub summary_screen: u64,
     /// No namer job for this session before this unix time (after a failure).
     pub backoff_until: u64,
     pub tw: super::transcript::Transcript,
@@ -106,6 +104,9 @@ pub struct Session {
     pub last_cwd: String,
     pub cols: u16,
     pub rows: u16,
+    /// The client whose window size the session has: the last one to type in it or to attach to it (a reconnect does
+    /// not count). Other clients' resizes are ignored while it is attached.
+    pub size_owner: Option<u64>,
     /// Inject the shell hooks (also on respawn).
     pub integration: bool,
     /// Commands seen through the shell hooks.
@@ -126,6 +127,16 @@ pub struct Session {
     /// A command was running when the summary was made (it is the one numbered `summary_seq + 1`).
     pub summary_running: bool,
     pub summary_branch: String,
+    /// The terminal title when the summary was made.
+    pub summary_title: String,
+    /// Output arrived since the screen was last hashed.
+    pub screen_fed: bool,
+    /// Hash of the screen text (no cursor, no colours), when it last changed, and as last shown to a client.
+    pub screen_hash: u64,
+    pub screen_changed: Option<std::time::Instant>,
+    pub seen_hash: u64,
+    /// `(active, unread)` as last pushed.
+    pub pushed_marks: (bool, bool),
 }
 
 fn winsize(cols: u16, rows: u16) -> Winsize {
@@ -205,9 +216,8 @@ impl Session {
             summary: String::new(),
             summary_seq: 0,
             recap_mark: 0,
-            recap_ctx: None,
             backoff_until: 0,
-            dirty: false,
+            summary_screen: 0,
             tw: super::transcript::Transcript::new(tdir, now, id),
             created: now,
             last_active: now,
@@ -222,6 +232,7 @@ impl Session {
             last_cwd: String::new(),
             cols,
             rows,
+            size_owner: None,
             integration,
             log: CommandLog::default(),
             pushed_status: (String::new(), 0),
@@ -234,6 +245,12 @@ impl Session {
             summary_asof: 0,
             summary_running: false,
             summary_branch: String::new(),
+            summary_title: String::new(),
+            screen_fed: false,
+            screen_hash: 0,
+            screen_changed: None,
+            seen_hash: 0,
+            pushed_marks: (false, false),
         };
         s.save_meta();
         Ok(s)
@@ -243,22 +260,17 @@ impl Session {
     pub fn feed(&mut self, data: &[u8]) {
         self.ring.push(data);
         self.parser.process(data);
+        self.screen_fed = true;
         self.tw.feed(data);
         let now = now_unix();
-        let noise = self.tw.take_noise();
         let items = self.tw.take_items();
-        if noise > 0 && !items.iter().any(|i| matches!(i, Item::Ev(ShellEv::Done(_) | ShellEv::Prompt))) {
-            self.log.noise(noise);
-        }
         for item in items {
             match item {
                 Item::Line(l) => self.log.line(&l),
                 Item::Ev(ShellEv::Title(t)) => {
                     let home = std::env::var("HOME").unwrap_or_default();
                     let shell_fg = (!self.log.integrated).then(|| self.fg_is_shell());
-                    if self.log.note_title(&t, shell_fg, &home, now) {
-                        self.dirty = true;
-                    }
+                    self.log.note_title(&t, shell_fg, &home);
                     if self.title_topic && (self.recap.is_empty() || self.recap_is_title) && !self.log.title.is_empty() {
                         if let Some(r) = super::namer::sanitize_recap(&self.log.title) {
                             self.recap = r;
@@ -267,15 +279,8 @@ impl Session {
                     }
                 }
                 Item::Ev(e) => {
-                    match &e {
-                        ShellEv::Done(_) => {
-                            self.dirty = true;
-                            self.note_cwd(); // `git checkout` etc. just ended
-                        }
-                        ShellEv::Prompt if self.log.is_running() => self.dirty = true,
-                        ShellEv::Cwd(p) if *p != self.log.cwd => self.dirty = true,
-                        ShellEv::CmdLine(c) if super::namer::is_ssh(c) => self.dirty = true,
-                        _ => {}
+                    if let ShellEv::Done(_) = &e {
+                        self.note_cwd(); // `git checkout` etc. just ended
                     }
                     self.log.apply(e, now)
                 }
@@ -309,12 +314,11 @@ impl Session {
         false
     }
 
-    /// Record the branch seen now. The first reading is only remembered; a later change marks the session dirty.
+    /// Record the branch seen now. The first reading is only remembered; a later change is news for the namer (`ctx_dirty`).
     pub fn set_branch(&mut self, b: String) -> bool {
         let changed = self.branch_seen && b != self.branch;
         self.branch_seen = true;
         if changed {
-            self.dirty = true;
             self.ctx_dirty = true;
         }
         self.branch = b;
@@ -388,6 +392,13 @@ impl Session {
         crate::proto::repaint(self.parser.screen())
     }
 
+    /// The lines that scrolled off the top of the main screen (oldest first, with their colours), for the client to
+    /// put into the real terminal's scrollback. Empty while an alternate-screen app runs (vt100 only exposes the
+    /// grid in view).
+    pub fn history(&mut self) -> Vec<u8> {
+        history_of(self.parser.screen_mut())
+    }
+
     /// Signal every process group in the session: the shell's and its jobs' (a job runs in its own group, so
     /// signalling only the shell's group misses e.g. a foreground `docker exec`).
     pub fn signal(&self, sig: Signal) {
@@ -432,13 +443,101 @@ impl Session {
             branch: self.branch.clone(),
             summary_unix: if self.summary.is_empty() { 0 } else { self.summary_asof },
             summary_stale: self.summary_stale(),
+            active: self.pushed_marks.0,
+            unread: self.pushed_marks.1,
         }
     }
+
+    /// What the namer summarizes: the screen text and the terminal title.
+    pub fn view_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        screen_hash(self.parser.screen()).hash(&mut h);
+        self.log.title.hash(&mut h);
+        h.finish()
+    }
+
+    /// Re-hash the screen if output arrived; `attached`: a client shows it now (so it is read). Returns true if the
+    /// session's activity or unread mark changed.
+    pub fn check_screen(&mut self, attached: bool, now: std::time::Instant) -> bool {
+        if std::mem::take(&mut self.screen_fed) {
+            let h = screen_hash(self.parser.screen());
+            if h != self.screen_hash {
+                self.screen_hash = h;
+                self.screen_changed = Some(now);
+            }
+        }
+        if attached {
+            self.seen_hash = self.screen_hash;
+        }
+        let active = !self.exited && self.screen_changed.is_some_and(|t| now.duration_since(t) < ACTIVE_FOR);
+        let marks = (active, self.screen_hash != self.seen_hash);
+        let changed = marks != self.pushed_marks;
+        self.pushed_marks = marks;
+        changed
+    }
+}
+
+/// A screen change this recent makes the session "active".
+pub const ACTIVE_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What the user would see: the text of the screen in view (not the cursor or colours, so a blinking cursor or a
+/// redraw of the same text is no change).
+pub fn screen_hash(screen: &vt100::Screen) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    screen.alternate_screen().hash(&mut h);
+    screen.contents().hash(&mut h);
+    h.finish()
+}
+
+/// See `Session::history`. Pages through the scrollback by moving the view offset, then puts the view back.
+pub fn history_of(screen: &mut vt100::Screen) -> Vec<u8> {
+    if screen.alternate_screen() {
+        return Vec::new();
+    }
+    let (rows, cols) = screen.size();
+    screen.set_scrollback(usize::MAX);
+    let total = screen.scrollback();
+    let mut out = Vec::new();
+    let mut off = total;
+    while off > 0 {
+        // With the view `off` rows back, its first min(off, rows) rows are scrollback lines.
+        screen.set_scrollback(off);
+        let take = off.min(rows as usize);
+        for row in screen.rows_formatted(0, cols).take(take) {
+            out.extend_from_slice(&row);
+            out.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        off -= take;
+    }
+    screen.set_scrollback(0);
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_is_the_scrolled_off_lines_in_order() {
+        let mut p = vt100::Parser::new(5, 20, 100);
+        let text: String = (1..=12).map(|i| format!("\x1b[1ml{i}\x1b[0m\r\n")).collect();
+        p.process(text.as_bytes());
+        // 13 lines (the last one empty) on a 5-row screen: l1..l8 scrolled off.
+        let h = String::from_utf8(history_of(p.screen_mut())).unwrap();
+        let plain: Vec<String> = h.split("\r\n").filter(|l| !l.is_empty()).map(|l| {
+            let mut q = vt100::Parser::new(1, 20, 0);
+            q.process(l.as_bytes());
+            q.screen().contents().trim().to_string()
+        }).collect();
+        assert_eq!(plain, (1..=8).map(|i| format!("l{i}")).collect::<Vec<_>>());
+        assert!(h.contains("\x1b[1m"), "bold kept: {h:?}");
+        assert_eq!(p.screen().scrollback(), 0, "view put back");
+        // Nothing while an alternate-screen app runs.
+        p.process(b"\x1b[?1049h");
+        assert!(history_of(p.screen_mut()).is_empty());
+    }
 
     #[test]
     fn ring_offsets() {

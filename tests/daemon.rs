@@ -300,6 +300,42 @@ fn kill_reaches_jobs_in_their_own_process_group() {
 }
 
 #[test]
+fn size_follows_the_last_user_and_detach_others_evicts() {
+    let d = Daemon::start();
+    let mut a = d.connect();
+    let id = a.attach(None, None);
+    let mut b = d.connect();
+    b.send(&C2S::Attach { session: Some(id), cols: 120, rows: 40, term: "xterm".into(), resume_from: None, cwd: None });
+    // A fresh attach takes the size; another client's window resize does not take it back.
+    a.send(&C2S::Resize { cols: 100, rows: 30 });
+    b.input("echo S$((1)) $(stty size)\n");
+    b.wait_output("S1 40 120");
+    // Typing does: the size follows the client in use.
+    a.input("echo S$((2)) $(stty size)\n");
+    a.wait_output("S2 30 100");
+    // A reconnect of the other client (resume) leaves the size alone.
+    b.send(&C2S::Attach { session: Some(id), cols: 120, rows: 40, term: "xterm".into(), resume_from: Some(0), cwd: None });
+    a.send(&C2S::Resize { cols: 90, rows: 20 });
+    a.input("echo S$((3)) $(stty size)\n");
+    a.wait_output("S3 20 90");
+    // M-D: the other client is told to quit and is no longer attached.
+    a.send(&C2S::DetachOthers { session: id });
+    loop {
+        if let S2C::Evicted = b.recv() {
+            break;
+        }
+    }
+    let clients = loop {
+        let v = a.list();
+        let n = v.iter().find(|s| s.id == id).unwrap().clients;
+        if n == 1 {
+            break n;
+        }
+    };
+    assert_eq!(clients, 1);
+}
+
+#[test]
 fn duplicate_input_is_dropped() {
     let d = Daemon::start();
     let mut c = d.connect();
@@ -704,7 +740,7 @@ fn interrupted_build_marks_the_summary_stale_and_opening_refreshes_it() {
     assert!(!s.summary.contains("still running") && s.summary.contains("No further commands"), "live sentence dropped: {}", s.summary);
     let second = bodies.lock().unwrap()[1].clone();
     assert!(second.contains("exit 130") && second.contains("sleep 300"), "digest lacks the interrupted command: {second}");
-    assert!(second.contains("earlier summary: Started a long build in the home directory.") && !second.contains("for 3 minutes"), "the old summary's live claim must not be fed back: {second}");
+    assert!(second.contains("older history (before this screen; may be out of date): Started a long build in the home directory.") && !second.contains("for 3 minutes"), "the old summary's live claim must not be fed back: {second}");
 }
 
 /// A `git checkout` (here: .git/HEAD rewritten, also through a worktree-style `.git` file) changes the branch shown, marks
@@ -757,6 +793,97 @@ fn branch_change_is_pushed_and_triggers_a_new_summary() {
     assert!(!session(&v, id1).pending);
     let all = bodies.lock().unwrap();
     let last = all.iter().rev().find(|b| b.contains("feature/coupons")).expect("a digest mentioning the new branch");
-    assert!(last.contains("branch changed since the earlier summary: main -> feature/coupons"), "{last}");
+    assert!(last.contains("branch changed since the older history: main -> feature/coupons"), "{last}");
     assert_eq!(all.len(), n_before + 1, "only the session whose branch changed is summarized again");
+}
+
+#[test]
+fn screen_changes_mark_activity_and_unread_until_shown() {
+    let d = Daemon::start();
+    let mut c = d.connect();
+    let id = c.attach(None, None);
+    c.wait_output("$");
+    // Output while nobody looks: the session is active, then (quiet again) unread.
+    c.input("sleep 1; echo done$((40+2))\n");
+    c.send(&C2S::Detach);
+    let (v, _) = c.until(10, |v| session(v, id).active);
+    assert!(session(&v, id).active);
+    let (v, _) = c.until(10, |v| !session(v, id).active && session(v, id).unread);
+    assert!(session(&v, id).unread);
+    // Showing it clears the mark.
+    c.attach(Some(id), None);
+    let (v, _) = c.until(10, |v| !session(v, id).unread);
+    assert!(!session(&v, id).unread);
+}
+
+/// A program that sets the terminal title moves on to a new task: the refresh
+/// does not get the old summary, which a small model would keep describing.
+#[test]
+fn new_title_starts_without_the_old_summary() {
+    let (port, bodies) = fake_llm(|n, _| format!("name: agent-task\ntopic: task {n}\nsummary: Worked on task number {n} in the agent."));
+    let env = api_env(port, "title");
+    let d = Daemon::start_with(&env, "/usr/bin/bash");
+    let mut c = d.connect();
+    let id = c.attach(None, None);
+    // Inside a program (here a nested sh), as an agent's TUI would set it.
+    c.input("sh\n");
+    let mut w = d.connect();
+    w.attach(Some(id), None);
+    let refresh = |w: &mut Conn, c: &mut Conn, title: &str, mark: &str, n: usize| {
+        c.input(&format!("printf '\\033]0;%s\\007' '{title}'; echo {mark}-$((1))\n"));
+        c.wait_output(&format!("{mark}-1"));
+        std::thread::sleep(Duration::from_millis(700));
+        w.send(&C2S::Watch(false));
+        std::thread::sleep(Duration::from_millis(200));
+        w.send(&C2S::Watch(true));
+        w.until(30, |v| session(v, id).summary.contains(&format!("task number {n}")) && !session(v, id).pending);
+        bodies.lock().unwrap()[n].clone()
+    };
+    let first = refresh(&mut w, &mut c, "Update codex", "A", 0);
+    // (The bodies are JSON: quotes escaped.)
+    assert!(first.contains(r#"title: \"Update codex\""#), "{first}");
+    // Same title, new output: a rolling update.
+    let second = refresh(&mut w, &mut c, "Update codex", "B", 1);
+    assert!(second.contains("older history (before this screen; may be out of date): Worked on task number 0"), "{second}");
+    // New title: no older history.
+    let third = refresh(&mut w, &mut c, "Write a bedtime story", "C", 2);
+    let third = third.rsplit(r#""role":"user""#).next().unwrap().to_string(); // the job's input, not the examples
+    assert!(third.contains(r#"title: \"Write a bedtime story\""#) && !third.contains("older history (before this screen"), "{third}");
+}
+
+/// The case the shell hooks cannot see: a build inside a nested shell (like `docker exec … bash` or `ssh`) fails, then
+/// succeeds. The model's input is the screen, so the refresh after the success shows it (and the older history).
+#[test]
+fn nested_shell_fail_then_success_reaches_the_model() {
+    let (port, bodies) = fake_llm(|n, _| {
+        if n == 0 {
+            "name: nested-build\ntopic: build failing in a nested shell\nsummary: Ran the build inside a nested shell; it failed.".to_string()
+        } else {
+            "name: nested-build\ntopic: build fixed in a nested shell\nsummary: Ran the build inside a nested shell; it failed, then succeeded.".to_string()
+        }
+    });
+    let env = api_env(port, "nested");
+    let d = Daemon::start_with(&env, "/usr/bin/bash");
+    let mut c = d.connect();
+    let id = c.attach(None, None);
+    c.input("sh\n");
+    c.input("echo BUILD-$((0))-FAILED\n");
+    c.wait_output("BUILD-0-FAILED");
+    let mut w = d.connect();
+    w.attach(Some(id), None);
+    w.send(&C2S::Watch(true));
+    let (v, _) = w.until(30, |v| session(v, id).summary.contains("it failed.") && !session(v, id).pending);
+    assert!(!session(&v, id).summary.is_empty());
+    c.input("echo BUILD-$((1))-OK\n");
+    c.wait_output("BUILD-1-OK");
+    std::thread::sleep(Duration::from_millis(300));
+    w.send(&C2S::Watch(false));
+    std::thread::sleep(Duration::from_millis(300));
+    w.send(&C2S::Watch(true));
+    let (v, _) = w.until(30, |v| session(v, id).summary.contains("succeeded") && !session(v, id).pending);
+    assert!(session(&v, id).recap.contains("fixed"));
+    let second = bodies.lock().unwrap()[1].clone();
+    assert!(second.contains("BUILD-1-OK") && second.contains("BUILD-0-FAILED"), "the screen is the input: {second}");
+    assert!(second.contains("older history (before this screen; may be out of date): Ran the build inside a nested shell; it failed."), "{second}");
+    assert!(second.contains("running command: sh"), "the hooks only see the outer command: {second}");
 }

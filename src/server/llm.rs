@@ -43,8 +43,9 @@ fn threads(cfg: &Config) -> (i32, i32) {
     thread_counts(std::thread::available_parallelism().map_or(1, |n| n.get()), cfg.llm_threads)
 }
 
-/// Digests are small; longer ones are rejected rather than growing the context.
-const MAX_JOB_TOKENS: usize = 700;
+/// Longest digest in tokens. A full screen of a TUI, or of non-English text, can be longer: then the oldest screen rows
+/// are dropped until it fits (`screen::drop_oldest_row`).
+const MAX_JOB_TOKENS: usize = 1024;
 const BATCH: usize = 512;
 
 // ---------------------------------------------------------------- fetching
@@ -238,14 +239,19 @@ impl Runner<'_> {
 
     /// Greedy reply for one digest.
     fn generate(&mut self, digest: &str) -> Result<String> {
-        let toks = self.prompt.tokens(digest)?;
         let n = self.prefix.len();
-        if toks.len() <= n || toks[..n] != self.prefix[..] {
-            bail!("prompt does not start with the cached prefix");
-        }
-        if toks.len() - n > MAX_JOB_TOKENS {
-            bail!("digest too long ({} tokens)", toks.len() - n);
-        }
+        let mut digest = digest.to_string();
+        let toks = loop {
+            let toks = self.prompt.tokens(&digest)?;
+            if toks.len() <= n || toks[..n] != self.prefix[..] {
+                bail!("prompt does not start with the cached prefix");
+            }
+            if toks.len() - n <= MAX_JOB_TOKENS {
+                break toks;
+            }
+            digest = super::screen::drop_oldest_row(&digest)
+                .ok_or_else(|| anyhow!("digest too long ({} tokens) even without screen rows", toks.len() - n))?;
+        };
         self.reset()?;
         self.eval(&toks[n..], n)?;
         let vocab = self.prompt.model.vocab();
@@ -329,12 +335,22 @@ pub fn run(
     ));
     for j in jobs {
         let t = Instant::now();
-        let res = r.generate(&j.text);
+        let mut res = r.generate(&j.text).map(|raw| (prompt::parse_answer(&raw), raw));
+        // A small model sometimes gives up on a long screen of unusual text (Granite: `name:` and end of text on a
+        // screen of Latvian prose). Once more with the bottom half of the screen.
+        if let Ok((a, raw)) = &res
+            && a.topic.is_none()
+            && a.summary.is_none()
+            && let Some(half) = super::screen::keep_bottom_half(&j.text)
+        {
+            log(format!("raw: {raw:?}; retrying with half the screen"));
+            res = r.generate(&half).map(|raw| (prompt::parse_answer(&raw), raw));
+        }
         log(format!("job {}: {:.2?}", j.sid, t.elapsed()));
         match res {
-            Ok(raw) => {
+            Ok((a, raw)) => {
                 log(format!("raw: {raw:?}"));
-                emit(j, Ok(prompt::parse_answer(&raw)))
+                emit(j, Ok(a))
             }
             Err(e) => emit(j, Err(e)),
         }

@@ -276,6 +276,8 @@ pub enum Action {
     New,
     Rename(SessionId, String),
     Kill(SessionId),
+    /// M-D: detach the selected session's other clients.
+    DetachOthers(SessionId),
     Detach,
     /// `<prefix> ?`
     Help,
@@ -565,6 +567,11 @@ impl Switcher {
         Some(self.sessions[i].id)
     }
 
+    /// Clients attached to `s` besides this one (which is attached to `current` while the switcher is open).
+    fn others(&self, s: &SessionInfo) -> u32 {
+        s.clients.saturating_sub(u32::from(Some(s.id) == self.current))
+    }
+
     /// The selected session; none while a group header is selected (renaming or closing a whole group is not a thing).
     fn selected(&self) -> Option<&SessionInfo> {
         let f = self.flat();
@@ -626,11 +633,11 @@ impl Switcher {
     }
 
     /// The summary area of `s`: `(before last command)` in front of a summary that predates the last command end,
-    /// `updated 4m ago` (or `↻ updating…` and the spinner while a naming run is pending) at the end of the last line.
+    /// `updated 4m ago` (or a quiet `↻ updating…` while a naming run is pending) at the end of the last line.
     fn summary_lines(&self, s: &SessionInfo, iw: usize, dh: usize, now: u64) -> Vec<String> {
         let w = iw.saturating_sub(2);
         let tail = if s.pending {
-            format!("{} updating… {}", if self.ascii { "~" } else { "↻" }, self.spinner())
+            format!("{} updating…", if self.ascii { "~" } else { "↻" })
         } else if s.summary_unix > 0 && !s.summary.is_empty() {
             format!("updated {} ago", age(now, s.summary_unix))
         } else {
@@ -674,9 +681,21 @@ impl Switcher {
         self.naming_paused = why.to_string();
     }
 
-    /// Is some session waiting for the namer (the spinner runs)?
-    pub fn any_pending(&self) -> bool {
-        self.sessions.iter().any(|s| s.pending)
+    /// Is some session's screen changing (its spinner runs)?
+    pub fn animating(&self) -> bool {
+        self.sessions.iter().any(|s| s.active)
+    }
+
+    /// The mark before a session's id: the spinner while its screen changes, `●` when it changed since a client last
+    /// showed it (nobody has seen the result yet), else blank (then the current session gets its `*`).
+    fn flag(&self, s: &SessionInfo) -> char {
+        if s.active {
+            self.spinner()
+        } else if s.unread {
+            if self.ascii { '+' } else { '●' }
+        } else {
+            ' '
+        }
     }
 
     /// Advance the spinner one frame.
@@ -796,6 +815,11 @@ impl Switcher {
                 self.top = 0;
             }
             Key::Alt('i') => self.detail = !self.detail,
+            Key::Alt('D') if !self.search => {
+                if let Some(s) = self.selected().filter(|s| self.others(s) > 0) {
+                    return Action::DetachOthers(s.id);
+                }
+            }
             Key::Alt('r') | Key::Alt('k') if self.search => {}
             Key::Alt('r') => {
                 if let Some(s) = self.selected() {
@@ -863,6 +887,7 @@ impl Switcher {
         let (bw, bh) = if rows < 50 { (cols, rows) } else { (cols.min(100), rows.min(30)) };
         let (bx, by) = ((cols - bw) / 2, (rows - bh) / 2);
         let iw = bw.saturating_sub(2);
+        let indent = if usage::layout(bw) == usage::Layout::Narrow { ROW_INDENT - 1 } else { ROW_INDENT };
         let ih = bh.saturating_sub(2);
         let dh = self.detail_rows(bh, ih.saturating_sub(2).max(1));
         let lh = (ih.saturating_sub(2 + dh)).max(1);
@@ -974,20 +999,23 @@ impl Switcher {
                 .unwrap_or(0)
                 .clamp(6, 24)
                 .min(iw.saturating_sub(12));
-            let spinner = self.spinner();
             // The lines of one session: its row, then the extras that fit.
             let row_lines = |pos: usize| -> Vec<(String, u8)> {
                 let s = &self.sessions[vis[pos]];
                 let selected = Some(pos) == sel_row;
                 let g = group_of(pos);
                 let ind = if g.is_some() { "  " } else { "" };
-                let mark = if Some(s.id) == self.current { '*' } else { ' ' };
-                let head = format!(" {ind}{mark}#{:<3} {} [{}] {} ", s.id, fit(&names[pos], name_w), s.clients, fit(if s.exited { "exited" } else { &s.fg_cmd }, 8));
+                // One column, apart from the id: activity / unread first, else `*` for the current session (listed first anyway).
+                let mark = match self.flag(s) {
+                    ' ' if Some(s.id) == self.current => '*',
+                    f => f,
+                };
+                let head = format!(" {ind}{mark}{}#{:<3} {} [{}] {} ", if indent == ROW_INDENT { " " } else { "" }, s.id, fit(&names[pos], name_w), s.clients, fit(if s.exited { "exited" } else { &s.fg_cmd }, 8));
                 let age = format!("{:>w$}", age(now, s.last_active_unix), w = AGE_W);
                 let (res, res_w) = usage::cell(s, &scale, s.rss_bytes == top_rss && top_rss > 0, lay, self.ascii);
                 let fixed = head.chars().count() + age.len() + 1;
                 // Drop the usage cell when even a short cwd would not fit next to it.
-                let show = iw >= fixed + res_w + 1 + if lay == usage::Layout::Narrow { 0 } else { 8 };
+                let show = iw >= fixed + res_w + 1 + if lay == usage::Layout::Narrow { 0 } else { 7 };
                 let w = if show { res_w + 1 } else { 0 };
                 let place = g.map_or_else(|| s.cwd.clone(), |g| grouping::subdir(s, g));
                 let room = iw.saturating_sub(fixed + w);
@@ -1000,7 +1028,7 @@ impl Switcher {
                     let cwd = fit_left(&place, room);
                     out.push((fit(&format!("{head}{cwd} {age}"), iw), selected as u8));
                 }
-                let pad = " ".repeat(7 + ind.len());
+                let pad = " ".repeat(indent + ind.len());
                 let mut extras: Vec<(String, u8)> = Vec::new();
                 if dt(pos) == 1 {
                     extras.push((fit(&format!("{pad}{}", usage::detail(s)), iw), 2 + selected as u8));
@@ -1010,7 +1038,7 @@ impl Switcher {
                     extras.push((fit(&format!("{pad}{text}"), iw), (if g.is_some() { 8 } else { 4 }) + selected as u8));
                 }
                 if has_topic(pos) {
-                    let t = if s.pending { format!("{} {}", s.recap, spinner).trim().to_string() } else { s.recap.clone() };
+                    let t = if s.pending { format!("{} …", s.recap).trim().to_string() } else { s.recap.clone() };
                     extras.push((fit(&format!("{pad}{t}"), iw), 2 + selected as u8));
                 }
                 // Tier 1 shows no topic: it is the last extra, and `height` leaves no room for it.
@@ -1188,6 +1216,13 @@ impl Switcher {
                     hints.push(h);
                 }
                 hints.extend([format!("RET C-s C-o M-r C-k {so}  C-g"), "RET C-s C-o M-r C-k M-s C-g".to_string(), "RET C-g".to_string()]);
+                // Other clients on the selected session (a forgotten one elsewhere, maybe sized differently): offer M-D
+                // at the end, dropping other hints before it.
+                let n = self.selected().map_or(0, |s| self.others(s));
+                if n > 0 {
+                    let o = format!("M-D detach {n} other client{}", if n == 1 { "" } else { "s" });
+                    hints = hints.iter().map(|h| format!("{h}  {o}")).chain([o.clone()]).chain(hints.clone()).collect();
+                }
                 hints.into_iter().find(|h| h.chars().count() <= iw).unwrap_or_default()
             }
         };
@@ -1243,12 +1278,12 @@ impl Switcher {
                             let (g, rest) = gutter(t);
                             format!("{g}{rest}")
                         }
-                        4 => status_row(t, false, 7),
-                        8 => status_row(t, false, 9),
+                        4 => status_row(t, false, indent),
+                        8 => status_row(t, false, indent + 2),
                         n => {
                             // The body starts with the plain blank of the gutter column: swap it for the marker.
                             let (g, _) = gutter(t);
-                            format!("{g}{}", status_row(t, true, if *n == 9 { 9 } else { 7 }).chars().skip(1).collect::<String>())
+                            format!("{g}{}", status_row(t, true, if *n == 9 { indent + 2 } else { indent }).chars().skip(1).collect::<String>())
                         }
                     }
                 }
@@ -1265,6 +1300,10 @@ impl Switcher {
 }
 
 // ---------------------------------------------------------------- text helpers
+
+/// Where a session's extra lines (status, topic, detail) start: under its name, past ` ● #id  ` (the narrow layout has
+/// no room for the space between mark and id: ` ●#id  `).
+const ROW_INDENT: usize = 8;
 
 /// A status row (`indent` columns, then the status): the leading symbol is coloured
 /// (green check, red cross, yellow running/editing); other statuses are dim.
@@ -1508,6 +1547,8 @@ mod tests {
             branch: String::new(),
             summary_unix: 0,
             summary_stale: false,
+            active: false,
+            unread: false,
             group: None,
         }
     }
@@ -1587,39 +1628,52 @@ mod tests {
     }
 
     #[test]
-    fn pending_spinner_after_topic() {
+    fn spinner_marks_activity_and_pending_is_quiet() {
         let mut a = with_recap(info(1, "a-b", 0, 1), "fixing the build");
         let mut sw = Switcher::new(vec![a.clone()], None);
         sw.ascii = false;
-        let topic_row = |sw: &mut Switcher| (1..=24).map(|r| text_at(&sw.render(80, 24, 100), r)).find(|l| l.contains("fixing the build")).unwrap().trim_matches(|c: char| c == '│' || c == ' ').to_string();
-        // nothing pending: no spinner, no timer need
-        assert!(!sw.any_pending());
-        let idle = topic_row(&mut sw);
-        assert!(idle.ends_with("fixing the build"), "{idle}");
-        sw.tick_spinner();
-        assert_eq!(topic_row(&mut sw), idle);
+        let rows = |sw: &mut Switcher| (1..=24).map(|r| text_at(&sw.render(80, 24, 100), r)).collect::<Vec<_>>();
+        let topic_row = |sw: &mut Switcher| rows(sw).into_iter().find(|l| l.contains("fixing the build")).unwrap().trim_matches(|c: char| c == '│' || c == ' ').to_string();
+        let id_row = |sw: &mut Switcher| rows(sw).into_iter().find(|l| l.contains("#1 ")).unwrap();
+        let braille = |l: &str| l.contains(|c| ('\u{2800}'..='\u{28ff}').contains(&c));
+        // idle: no marks, no timer need
+        assert!(!sw.animating());
+        assert!(topic_row(&mut sw).ends_with("fixing the build"));
+        assert!(!braille(&id_row(&mut sw)) && !id_row(&mut sw).contains('●'));
+        // a pending summary: a quiet `…`, no animation
         a.pending = true;
-        sw.update(vec![a], None);
-        assert!(sw.any_pending());
-        let f0 = topic_row(&mut sw);
-        assert!(f0.contains("fixing the build ") && f0.contains(|c| ('\u{2800}'..='\u{28ff}').contains(&c)), "{f0}");
+        sw.update(vec![a.clone()], None);
+        assert!(!sw.animating());
+        assert!(topic_row(&mut sw).ends_with("fixing the build …"), "{}", topic_row(&mut sw));
+        // the screen is changing: the spinner runs in front of the id
+        a.pending = false;
+        a.active = true;
+        a.unread = true;
+        sw.update(vec![a.clone()], None);
+        assert!(sw.animating());
+        let f0 = id_row(&mut sw);
+        assert!(braille(&f0) && f0.contains("#1"), "{f0}");
         sw.tick_spinner();
-        let f1 = topic_row(&mut sw);
-        assert_ne!(f0, f1);
-        // ten frames wrap around
-        for _ in 0..10 {
-            sw.tick_spinner();
-        }
-        assert_eq!(topic_row(&mut sw), f1);
-        // ASCII mode cycles | / - \
+        assert_ne!(id_row(&mut sw), f0);
+        // it stopped, nobody has looked yet: the unread dot
+        a.active = false;
+        sw.update(vec![a.clone()], None);
+        assert!(!sw.animating());
+        let r = id_row(&mut sw);
+        assert!(r.contains("● #1") && !braille(&r), "{r}");
         sw.ascii = true;
-        let mut seen = Vec::new();
-        for _ in 0..4 {
-            seen.push(topic_row(&mut sw).chars().last().unwrap());
-            sw.tick_spinner();
-        }
-        seen.sort();
-        assert_eq!(seen, vec!['-', '/', '\\', '|']);
+        assert!(id_row(&mut sw).contains("+ #1"));
+    }
+
+    #[test]
+    fn detach_others_hint_at_the_end_and_key() {
+        let mut sw = Switcher::new(vec![info(1, "a-b", 2, 1)], None);
+        let hint = |sw: &mut Switcher, w| (1..=24).map(|r| text_at(&sw.render(w, 24, 100), r)).find(|l| l.contains("RET")).unwrap_or_default();
+        let wide = hint(&mut sw, 160);
+        assert!(wide.trim_end().trim_end_matches('│').trim_end().ends_with("M-D detach 2 other clients"), "{wide}");
+        assert!(wide.find("RET") < wide.find("M-D"), "{wide}");
+        assert!(hint(&mut sw, 80).contains("M-D detach 2 other clients"), "kept when narrow");
+        assert!(matches!(sw.handle(Key::Alt('D')), Action::DetachOthers(_)));
     }
 
     #[test]

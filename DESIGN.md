@@ -13,7 +13,7 @@ and session names that the server picks on its own. It does not split panes.
 ```
 nt [<ssh-dest>] [-- ssh args]     start a new session on the local daemon (unix socket, no crypto; started if needed),
                          or remote: bootstrap over ssh, then direct TCP
-nt -s | --sessions [<ssh-dest>]  open the session list (switcher); with no sessions, start a new one
+nt -s | --sessions [<ssh-dest>]  open the session list (switcher); with no sessions, say so and exit
 nt ls [<ssh-dest>]       print sessions, one line each: id, name, status, topic; grouped like the switcher (header line per group,
                          members indented by 2, ungrouped sessions last)
 nt restart [<ssh-dest>]  stop a running daemon of any version and start the current one (ends its sessions);
@@ -37,9 +37,13 @@ key list (`client/help.rs`), drawn over the current screen or switcher and remov
   protocol as TCP, in plaintext, plus `Register`.
 - TCP listener on `0.0.0.0:4022` by default (config `port`). It only accepts registered client keys.
 - Session = PTY (spawns `$SHELL -l`, `TERM` from the first client, `NT_SESSION=<id>` in the environment) + a `vt100::Parser`
-  (screen state, 1000 lines of scrollback) + an output ring buffer (1 MiB) addressed by absolute byte offset.
+  (screen state, 5000 lines of scrollback, 32 bytes per cell: ~19 MB for a full one at 120 columns) + an output ring buffer (1 MiB) addressed by absolute byte offset.
 - PTY: `nix::pty::openpty` + `std::process::Command` with `pre_exec` running setsid + TIOCSCTTY. The master fd is non-blocking in
-  `tokio::io::unix::AsyncFd`. PTY size = the size of the attached client that most recently sent input or a resize.
+  `tokio::io::unix::AsyncFd`. PTY size = the size of the session's *size owner*: the client that last typed in it or freshly attached
+  to it. Other attached clients' resizes are ignored while the owner is attached, and a reconnect (`Attach` with `resume_from`) does
+  not take the size from an attached owner, so a forgotten client elsewhere cannot fight over it. `C2S::DetachOthers` (switcher `M-D`)
+  sends the session's other clients `S2C::Evicted` (they quit) and marks their registrations, so a remote one whose connection is
+  dead right now does not resume the session when it reconnects (attaching it again by choice is fine).
 - When the shell exits the session does not end: it becomes `exited`, keeping its screen, ring, transcript, name, topic and last cwd
   (sampled from /proc on every Enter and every naming tick). Input is ignored. `C2S::Respawn` starts `$SHELL -l` again in that cwd
   (same id, transcript continues, attached clients get a `Redraw`). `C2S::Kill` on an exited session ends it at once; on a live one
@@ -50,7 +54,7 @@ key list (`client/help.rs`), drawn over the current screen or switcher and remov
   CPU baseline is taken and the first CPU figure follows 0.7 s later (a figure averaged over the 30 s idle window would be meaningless).
   A queued `Sessions` message is replaced by a newer one, so a slow link never delivers old numbers.
 - **Branch**: the server reads the git branch of each shell's cwd from `.git/HEAD` (worktrees through the `.git` file) on every Enter, OSC 133 `D`, naming
-  tick and, while a switcher is open, every sampling tick. A change marks the session dirty and `ctx_dirty` (a branch or group change is news by itself:
+  tick and, while a switcher is open, every sampling tick. A change sets `ctx_dirty` (a branch or group change is news by itself:
   no new command is needed for a new summary). `SessionInfo.branch` is shown by the clients.
 
 ## Wire protocol (`src/proto.rs`)
@@ -65,6 +69,7 @@ enum C2S {
   Resize { cols, rows },
   Rename { session, name },                       // empty name = back to automatic naming
   Kill { session }, Respawn { session },
+  DetachOthers { session },                       // every other client of the session gets Evicted
   Search { query },
   // plus switcher-open notification and local-only Register
 }
@@ -73,13 +78,15 @@ enum S2C {
   Sessions(Vec<SessionInfo>),                     // reply to List; also pushed when names, status or the set change
   Attached { session },
   Output { offset, data },                        // offset = absolute stream position of data[0]
+  History(Vec<u8>),                               // scrolled-off lines, sent before Redraw on a fresh attach
   Redraw { offset, data },                        // full repaint from the vt100 state; the stream continues at offset
+  Evicted,                                        // another client detached this one (DetachOthers): quit
   SessionEnded { session },
   SearchResults(Vec<..>), Error(String), Pong,
 }
 ```
 `SessionInfo` carries id, name, name source (`Initial | Heuristic | Llm | User`; `User` is locked), timestamps, client count, size,
-cwd, foreground command, status, topic (`recap`), summary, exited flag, cpu and rss, `group: Option<GroupInfo {key, label, shown}>`, `branch`, `summary_unix` and `summary_stale`. `PROTO_VERSION` is 7 (`branch`, `summary_unix`, `summary_stale`; before: `group`; before: `pending`, `S2C::NamerError`, `S2C::NamerPaused`).
+cwd, foreground command, status, topic (`recap`), summary, exited flag, cpu and rss, `group: Option<GroupInfo {key, label, shown}>`, `branch`, `summary_unix`, `summary_stale`, `active` (the screen changed in the last 2 s) and `unread` (changed since a client last showed it). `PROTO_VERSION` is 8 (`active`, `unread`, `S2C::History`, `S2C::Evicted`, `C2S::DetachOthers`; before: `branch`, `summary_unix`, `summary_stale`; before: `group`; before: `pending`, `S2C::NamerError`, `S2C::NamerPaused`).
 
 Version mismatch: `Hello` is the first variant of `C2S` and `proto` its first field, and the server decodes only that prefix of the first
 frame (`FrameReader::read_hello`), so any peer version is recognised even if other fields changed. On a mismatch the server sends
@@ -88,7 +95,10 @@ and closes; the client prints it and exits instead of reconnecting (`VersionMism
 reports that as a probable version mismatch too. This covers `nt bootstrap` and local autostart, which both go through `open_link`.
 
 Resume: on `Attach` with `resume_from = Some(o)`, if `o` is still in the ring the server replays `Output` from `o`, which keeps the
-client's native scrollback intact. Otherwise it sends `Redraw`. Switching sessions always sends `Redraw`.
+client's native scrollback intact. Otherwise it sends `S2C::History` (the main screen's scrollback lines, oldest first, with
+their colours; empty while an alternate-screen app runs, since vt100 only exposes the grid in view) and then `Redraw`. The client
+writes the history into the real terminal so it lands in the emulator's own scrollback; on a switch from another session it clears
+that scrollback first (`ESC [3J`), so scrolling up always shows the attached session's past (e.g. a long `claude` conversation).
 
 ## Remote connection and security
 1. The client runs `ssh <dest> [ssh args] nt bootstrap` (`NT_REMOTE_CMD` overrides `nt`). Bootstrap starts the daemon if needed,
@@ -156,7 +166,7 @@ plaintext but sits in a 0700 directory.
   search over the summaries and the transcripts, newest first, at most 3 hits per session and 50 in total (a summary match comes first
   and is shown as `summary: …snippet`).
   **Summary area**: the rows between the list and the hint line are reserved for the SELECTED session's summary, word-wrapped to the
-  box width, at most 3 lines (the last ends in `…` if cut), dim. Its last line ends with `· updated 4m ago`, or `· ↻ updating…` and the spinner while
+  box width, at most 3 lines (the last ends in `…` if cut), dim. Its last line ends with `· updated 4m ago`, or `· ↻ updating…` (static, no spinner) while
   the session's naming run is pending; a summary that predates a command that started or ended after it (`summary_stale`, also set by a branch/group change)
   is prefixed `(before last command)` until it is refreshed. Rows are never added per entry. It is shown only when the box has at
   least 20 rows, the list keeps room for up to 8 entries above it and some session has a summary; otherwise it is hidden and `M-i`
@@ -164,8 +174,8 @@ plaintext but sits in a 0700 directory.
   **Closing**: `C-k` closes the selected session when the filter cursor is at the end of the filter text (where kill-line would do
   nothing; always kill-line in full-text search mode), otherwise it is kill-line. `M-k` always closes. A live session asks y/n; an exited
   one is closed at once.
-- An exited session shows `shell exited · RET new shell · C-k close` on the bottom row; RET sends `Respawn`, `C-k` or `M-k` (no prefix)
-  sends `Kill` at once (no y/n, the exit was the first step). `C-] k` does the same on an exited session.
+- An exited session shows `shell exited · RET new shell · C-k close & quit` on the bottom row; RET sends `Respawn`, `C-k` or `M-k` (no
+  prefix) sends `Kill` at once (no y/n, the exit was the first step) and quits the client. `C-] k` does the same on an exited session.
 
 ## Naming, status, topic and summary
 - Initial name: random `adjective-noun`, source `Initial`.
@@ -176,12 +186,12 @@ plaintext but sits in a 0700 directory.
   clients (at most 1/s per session): `⏵ make -j8 · 3m12s` running, `✎ vim src/proto.rs` in an alt-screen app, `✓ cargo build · 2m ago`,
   `✗ cargo test (101) · 5s ago` (+ first error line when there is room), `idle · ~/src/nt`. Durations are placeholders
   (`{dur}`/`{ago}`) filled by the clients from `status_since`.
-- **Topic** (LLM): what the session is about *right now* in at most 50 characters (newest commands, current branch and title decide; the rolling summary is history
-  and must not override them), describing the work and not the status, and not restating the last command. When the branch changed since the earlier summary the
-  digest says `branch changed since the earlier summary: A -> B`.
+- **Topic** (LLM): what the session is about *right now* in at most 50 characters (the bottom of the screen, current branch and title decide; the rolling summary is history
+  and must not override them), describing the work and not the status, and not restating the last command. When the branch changed since the previous summary the
+  input says `branch changed since the older history: A -> B`.
 - **Summary** (LLM): past-tense history of what was done and its outcomes. It must not state live state or durations; the status line shows that. The daemon
   enforces it: `namer::drop_live_state` removes sentences with `currently`, `is running`, `still running`, `in progress`, `is building` or `for N minutes`
-  from a new summary when no command is running, and from the earlier summary before it is fed back into the digest.
+  from a new summary when no command is running, and from the previous summary before it is fed back into the input.
 - **Summary** (LLM, rolling): 2-4 short factual sentences, at most 300 characters, of what has been done in the session overall (project or
   host, goal, what was tried, what happened, where it stands). Each run gets the previous summary plus the activity since, and updates it.
 
@@ -190,7 +200,7 @@ Each session's output is written as plain text to `~/.local/state/nt/transcripts
 `vte`-based stripper (printable characters; `\n` flushes a line; `\r`, BS and erase-line edit the current line; other escapes are
 dropped). While the alternate screen is active nothing is transcribed; a marker line `[<fg_cmd> in <cwd>]` is written instead.
 Writes are buffered and flushed every few seconds. A file is capped at 4 MiB (when full it keeps the last 2 MiB). A `.meta` file
-stores the name, name source, topic and summary. Transcripts feed search and the naming digest.
+stores the name, name source, topic and summary. Transcripts feed search.
 
 Debug aid: starting the daemon with `NT_NAMER_NOW=1` makes the naming loop tick every second and run a batch as soon as a session has
 any new output, ignoring the batch interval, minimum-output and backoff limits. `contrib/demo/` uses it to have summaries ready for the
@@ -215,37 +225,37 @@ recording. Not documented for users.
   per command (`title` = latest, `titles` = last 5 distinct) and per session (`title`, cleared when the command ends). Default shell titles
   are ignored: any title while the shell is foreground (after `D` until the next command starts; without integration `tcgetpgrp == shell`),
   `user@host: path`, the cwd (also `~`-abbreviated) and the command line itself. A leading decorative glyph/spinner (`✳ ⠂ · *`) is stripped, so
-  glyph animation neither changes the title nor marks the session dirty; real text changes do, at most once per 10 s.
-  Status: `⏵ claude · Fix reconnect bug in proto.rs · 12m` (alt screen: `✎ vim · README.md`). The stripper counts redraws (cursor up/home,
-  erase, in-place overwrites); a command with >= 20 and more redraws than lines is TUI noise: its digest line says so and its output lines are
-  dropped, leaving the title (`title: "…" (earlier: "…")`). Without an LLM the topic is the title.
+  glyph animation does not change the title; real text changes do.
+  Status: `⏵ claude · Fix reconnect bug in proto.rs · 12m` (alt screen: `✎ vim · README.md`). Without an LLM the
+  topic is the title.
 
 ## LLM naming
-- **Digest** (input; the same format is used by `nt name-test` and the benchmark). The first run of a session lists its recent
-  commands (at most 12, the newest); a later run is **rolling**: it starts with `earlier summary: <the stored summary>`, then lists only
-  the commands newer than that summary (`CommandLog` numbers them; `Session.summary_seq` is the number the summary covers, minus a
-  command that was still running, which is listed again with its result) under `new commands since then (oldest first):`. Extra lines
-  `hosts:` (ssh destinations) and `files:` (arguments of editor commands) are derived from the listed commands. A session without
-  new commands is not re-summarized. Without shell integration the guessed digest uses the transcript tail since the last run.
-  Example of a rolling digest:
+- **Input: the screen** (`server/screen.rs`; the same format is used by `nt name-test` and the benchmark). The model sees what the
+  user would see, so every kind of session gets the same input: a plain shell, a shell inside `docker exec` / `ssh` / `sudo -i` that
+  the hooks cannot see into, an editor or an AI agent's TUI. Lines: the `cwd:` header with git repo and branch (plus
+  `branch changed since the older history: A -> B` when it did), the
+  meaningful terminal `title:`, the `foreground:` program, from the shell hooks of the session's own shell one `last command: make ·
+  exit 2` / `… · ok` / `running command: make` line, then the screen text under `screen (newest at the bottom):`, each row prefixed
+  with `| `, and last, on a rolling update, the previous summary as `older history (before this screen; may be out of date): …`
+  (live-state sentences dropped). It goes after the screen because small models read the input in order: with the old summary first
+  they tended to repeat it (an error that the screen shows fixed); last, it reads as background (bench/RESULTS.md). It is left
+  out when the terminal title changed to a new non-empty one since that summary (an agent's or editor's next task): Granite kept describing the old task even with the new title in the input.
+- **Length**: at most 1024 tokens per digest (`llm::MAX_JOB_TOKENS`). A longer one (a full TUI screen, non-English text) loses
+  its oldest screen rows until it fits (`screen::drop_oldest_row`). When the answer has neither topic nor summary (Granite
+  writes `name:` and stops on a long screen of Latvian prose) the job is retried once with the bottom half of the screen. The screen text is cleaned (`screen_lines`): rows right-trimmed and clipped to 120 chars, TUI borders stripped (a row of
+  only box/frame glyphs counts as blank, `│ text │` keeps the text), runs of blank rows collapsed, at most the bottom 30 rows.
+  Example of a rolling update:
 ```
-cwd: ~/src/nt (git nt, branch reconnect)
-commands (oldest first):
-  [~/src/nt] cargo build            ok      12s
-  [~/src/nt] cargo test             exit 101 40s
-      | error[E0308]: mismatched types --> src/proto.rs:88
-  [~/src/nt] make deploy            running 3m
-      | Uploading 45%
-foreground: make deploy
-```
-```
-earlier summary: Working on the nt reconnect logic in ~/src/nt. Fixed a type error in proto.rs after a failed cargo test.
-cwd: ~/src/nt (git nt, branch reconnect)
-new commands since then (oldest first):
-  [~/src/nt] cargo test             ok      52s
-  [~/src/nt] make deploy            running 3m
-      | Uploading 45%
-foreground: make deploy
+cwd: ~/work/billing (git billing, branch fix-rounding)
+foreground: bash
+last command: git push origin fix-rounding · exit 1
+screen (newest at the bottom):
+| user@host:~/work/billing$ pytest -q
+| 41 passed in 18.20s
+| user@host:~/work/billing$ git push origin fix-rounding
+|  ! [rejected]        fix-rounding -> fix-rounding (fetch first)
+| user@host:~/work/billing$
+older history (before this screen; may be out of date): Worked on the invoice service in ~/work/billing (branch fix-rounding). pytest failed 3 tests in tests/test_totals.py.
 ```
 - **Output**: three lines, `name: <2-4 lowercase kebab words>`, `topic: <= 50 chars>` and `summary: <2-4 short factual sentences, <= 300
   chars>`. Only the first `name:` line, the first `topic:` line after it and the first `summary:` line after that (plus wrapped
@@ -258,27 +268,35 @@ foreground: make deploy
   `annotate` alone), in the exact and the lowercase form, and only if they have at least 3 characters. The prompt says these are placeholders to
   never interpret (a login name that looks like a word or acronym would otherwise end up in topics). Changing the prompt text changes the
   evaluated prefix tokens and with them the prefix-cache key, so the old cache file is replaced on the next start.
-- **Prompt**: prompt v3, the one chosen by the benchmark (`src/server/prompt.rs`, `bench/prompts/v3.json`, generated by
-  `bench/prompt_from_rs.py`): a system message with rules (including how to update an earlier summary and not to invent details) and five
-  few-shot user/assistant turns (three first-run digests, two rolling updates), then the digest as the last user turn, rendered with the
+- **Prompt**: prompt v5 (`src/server/prompt.rs`; `bench/prompt_from_rs.py v5` writes `bench/prompts/v5.json`): a system message with
+  rules (including how to update the older history, that the bottom of the screen is the newest, that a foreign prompt means a container
+  or another machine, and not to invent details) and six few-shot user/assistant turns (a failing build, Claude Code at work, a shell
+  inside a container, vim; then two rolling updates), then the session's input as the last user turn, rendered with the
   GGUF's own chat template (Qwen3-style templates get an empty think block). Greedy decoding, at most 130 new tokens, stop after the
   summary line.
 - **Process model**: naming runs in a short-lived child, `nt namer`, never inside the daemon; the daemon sends it jobs on a line
   protocol and reads results back. The child runs at SCHED_IDLE, nice 19 and idle I/O priority. The daemon spawns it as `/proc/self/exe` (works after
   an upgrade replaced the binary on disk) and applies each result as soon as the child prints it. If a batch fails the daemon backs
   off for 5 minutes, keeps the error (`S2C::NamerError`, sent before `Sessions` in the reply to `List` and pushed on change) and the
-  switcher title shows `naming: error, see server.log` while `nt ls` prints it. `SessionInfo.pending` marks sessions in the running batch (a dim braille spinner `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, ASCII `|/-\`, after the topic, animated by the client at ~8 fps only while the switcher is open and a session is pending). When the resource guards skip a run, the server sends `S2C::NamerPaused(reason)` (`battery`, `low memory`, `memory pressure`) and the switcher title shows a dim `naming paused: <reason>`.
-- **Scheduling**: a session is *dirty* after OSC 133 `D` (or a prompt ending a command), a cwd change (OSC 7), an `ssh` command line,
-  or >= 1 KiB new transcript (`Session::dirty`, cleared when a job is built). **Opening the switcher refreshes every session with activity since its summary** (a command started or ended, including Ctrl-C'd ones, whose OSC 133 `D` carries
-  the exit 130; cwd, branch or group change; or >= 256 B of new output, instead of 1 KiB), current session first, at once and without the per-session failure
-  backoff; sessions that do not fit in the batch of 4 are shown pending too and follow in the next batch. If the resource guards postpone it, it is retried on
-  every tick while the switcher stays open. Staleness is exact, not timed: a summary made while command N ran covers N-1; it is stale when a later command exists or N has ended.
-  Background: a batch when some dirty session has had no output for 20 s,
-  at most one batch per 2 min (measured from the last start). `Watch(true)` wakes the loop: a batch starts at once for dirty sessions with no cooldown (the resource guards still apply). If a batch is
-  already running, or more sessions are due than fit in one batch (4), the loop runs a follow-up batch right after it ends while a client still watches.
+  switcher title shows `naming: error, see server.log` while `nt ls` prints it. `SessionInfo.pending` marks sessions in the running batch (a quiet `…` after the topic and `↻ updating…` in the summary area; no animation).
+  **Activity and unread**: every 500 ms the server hashes the screen text (no cursor, no colours) of each session that got output.
+  `SessionInfo.active` = the hash changed in the last 2 s; `SessionInfo.unread` = it differs from the hash recorded while some client
+  had the session attached. The switcher shows them in the mark column before the id: a braille spinner `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` (ASCII `|/-\`)
+  for active, animated at ~8 fps only while the switcher is open and a session is active, `●` (ASCII `+`) for unread, else `*` for the
+  current session. When the resource guards skip a run, the server sends `S2C::NamerPaused(reason)` (`battery`, `low memory`, `memory pressure`) and the switcher title shows a dim `naming paused: <reason>`.
+- **Scheduling**: there is news for a session when its *view* (`Session::view_hash`: the screen text plus the terminal title) differs
+  from the one its summary was made from (`summary_screen`, set when a result is applied), or its branch / group changed (`ctx_dirty`).
+  **Opening the switcher refreshes every session with news**, current session first, at once and without the per-session failure
+  backoff; sessions that do not fit in the batch of 4 are shown pending too and follow in the next batch. If the resource guards postpone
+  it, it is retried on every tick while the switcher stays open. Background: a batch when some session with news has had no output for
+  20 s (a build or an agent at work is summarized once its screen settles), at most one batch per 2 min (measured from the last start).
+  `Watch(true)` wakes the loop: a batch starts at once with no cooldown (the resource guards still apply). If a batch is already running,
+  or more sessions are due than fit in one batch (4), the loop runs a follow-up batch right after it ends while a client still watches.
+  The `(before last command)` marker is separate and exact: a summary made while command N ran covers N-1; it is stale when a later command
+  exists or N has ended.
   Job order in a watched batch: the watching client's current session first, then by last use (the switcher's order); results are applied and pushed per session as the child prints them. Pure rules: `namer::batch_allowed`, `session_ready`.
 - **Prefix cache**: the evaluated prefix state (`state_seq_save_file`, any architecture) is stored in `$XDG_CACHE_HOME/nt/prefix-<key>.state`,
-  key = blake3 of model path, size, prefix tokens and `n_ctx` (constant: prefix + 700 + 130 + 16, so it does not depend on the jobs). Other `prefix-*` files are
+  key = blake3 of model path, size, prefix tokens and `n_ctx` (constant: prefix + `MAX_JOB_TOKENS` (1024) + 130 + 16, so it does not depend on the jobs). Other `prefix-*` files are
   deleted. Measured with Granite 1B on this machine (debug build, 2 threads, idle priority): first result after opening the switcher 26.4 s cold, 6.3 s warm; the state file is 121 MB.
 - **Resource safety** (`src/server/guard.rs`, pure functions over /proc and /sys text, unit tested): before a local run `MemAvailable >= model x 1.3 + 300 MiB + 1 GiB`,
   `some avg10 < 5` (`< 25` when free memory is at least 3x the need) and not on battery (config `llm_on_battery`, default false), else the run is postponed (logged once per episode, dirty flags stay). The child sets `oom_score_adj` 1000,
@@ -302,8 +320,8 @@ foreground: make deploy
   `reasoning_effort: minimal` and `max_completion_tokens` (400), others `temperature: 0` and `max_tokens: 130`. The request JSON is built by
   hand (strings only) and the reply read by locating `choices[0].message.content`; this is the only JSON in the program, so there is
   no serde_json.
-- **Privacy**: with `local` nothing leaves the machine. With `api` the digest (the earlier summary, cwd, repo, branch, last commands with status and a few
-  output lines) is sent to the provider after `redact` masks `key=value` / `key: value` pairs whose key contains key, token, secret,
+- **Privacy**: with `local` nothing leaves the machine. With `api` the input (the previous summary, cwd, repo, branch, title, last command and the text on the
+  screen) is sent to the provider after `redact` masks `key=value` / `key: value` pairs whose key contains key, token, secret,
   passw, pwd, credential or auth, `Bearer` tokens, `--password x`-style flags, `user:pass@` in URLs, hex/base64-looking runs of 32+
   characters and well-known token prefixes (`sk-`, `ghp_`, `AKIA`, ...). This is best effort, not a guarantee; use `local` or `off`
   if commands or output may be sensitive. Without the `llm` feature or with `off`, only heuristic names are used.
@@ -325,7 +343,8 @@ src/proto.rs              messages, framing, crypto wrapper
 src/config.rs             config reader
 src/server/mod.rs         daemon, listeners, client handling
 src/server/session.rs     pty, parser, ring buffer
-src/server/shell.rs       shell hooks, OSC parsing, command log, digest, status
+src/server/shell.rs       shell hooks, OSC parsing, command log, status
+src/server/screen.rs      the model input: cleaned screen text plus cwd, title, foreground and last command
 src/server/naming.rs      initial + heuristic names
 src/server/transcript.rs  vte stripper, buffered writer, .meta, search
 src/server/resources.rs   per-session CPU/RSS sampling

@@ -17,7 +17,7 @@ use crate::proto::SessionId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub sid: SessionId,
-    /// The model input (see `shell::CommandLog::digest` / `guess_digest`).
+    /// The model input (see `screen::digest`).
     pub text: String,
 }
 
@@ -218,72 +218,6 @@ pub fn drop_live_state(summary: &str, running: bool) -> Option<String> {
     sanitize_summary(&kept.join(" "))
 }
 
-// ---------------------------------------------------------------- digest
-
-/// The command typed on a prompt-looking line (`user@host:~$ ls`, `$ ls`, `% ls`, `# ls`, `> ls`).
-fn prompt_command(line: &str) -> Option<&str> {
-    let l = line.trim_end();
-    let (at, _) = ["$ ", "% ", "# ", "> "]
-        .iter()
-        .filter_map(|m| l.find(m).map(|i| (i, m)))
-        .filter(|&(i, m)| if i == 0 { matches!(*m, "$ " | "% ") } else { i <= 80 && !l[..i].ends_with([' ', '-', '=', '|']) })
-        .min_by_key(|&(i, _)| i)?;
-    let cmd = l[at + 2..].trim();
-    (!cmd.is_empty()).then_some(cmd)
-}
-
-/// The digest for a session without shell integration: commands guessed from prompt-looking transcript
-/// lines (exit status unknown), the last few error-looking lines under the final one.
-pub fn guess_digest(header: &str, text: &str, fg: &str, prev: Option<&str>) -> String {
-    let clip = |s: &str, n: usize| s.chars().take(n).collect::<String>();
-    let mut cmds: Vec<String> = Vec::new();
-    let mut errs: Vec<String> = Vec::new();
-    for line in text.lines() {
-        if let Some(c) = prompt_command(line) {
-            let c = clip(c, 80);
-            if cmds.last() != Some(&c) {
-                cmds.push(c);
-            }
-        } else {
-            let low = line.to_lowercase();
-            if super::shell::ERROR_WORDS.iter().any(|w| low.contains(w)) {
-                let e = clip(line.trim(), 100);
-                if !errs.contains(&e) {
-                    errs.push(e);
-                }
-            }
-        }
-    }
-    let tail = |v: &mut Vec<String>, n: usize| v.drain(..v.len().saturating_sub(n)).for_each(drop);
-    tail(&mut cmds, 8);
-    tail(&mut errs, 3);
-    let mut out = String::new();
-    if let Some(p) = prev {
-        out.push_str(&format!("earlier summary: {}\n", p.trim()));
-    }
-    out.push_str(&format!("{header}\n{}\n", if prev.is_some() { "new commands since then (oldest first):" } else { "commands (oldest first):" }));
-    if cmds.is_empty() && errs.is_empty() {
-        // Nothing recognisable: the last few lines of output.
-        let mut last: Vec<String> = text.lines().filter(|l| !l.trim().is_empty()).map(|l| clip(l.trim(), 100)).collect();
-        tail(&mut last, 5);
-        last.iter().for_each(|l| out.push_str(&format!("      | {l}\n")));
-    }
-    let n = cmds.len();
-    for (i, c) in cmds.iter().enumerate() {
-        out.push_str(&format!("  {c}\n"));
-        if i + 1 == n {
-            errs.iter().for_each(|e| out.push_str(&format!("      | {e}\n")));
-        }
-    }
-    if cmds.is_empty() {
-        errs.iter().for_each(|e| out.push_str(&format!("      | {e}\n")));
-    }
-    if !fg.is_empty() {
-        out.push_str(&format!("foreground: {fg}\n"));
-    }
-    out
-}
-
 // ---------------------------------------------------------------- scheduling
 
 use std::time::Duration;
@@ -292,11 +226,6 @@ use std::time::Duration;
 pub const BATCH_EVERY: Duration = Duration::from_secs(120);
 /// A session must have been silent this long before a background batch picks it up.
 pub const QUIET_FOR: Duration = Duration::from_secs(20);
-
-/// `ssh host ...`, also with a path or `sudo`-less prefix like `/usr/bin/ssh`.
-pub fn is_ssh(cmd: &str) -> bool {
-    cmd.split_whitespace().next().is_some_and(|w| w.rsplit('/').next() == Some("ssh"))
-}
 
 /// May a batch start now? `since_start`: time since the last batch started (None = never).
 /// `force` is the switcher-open request: no cooldown (the resource guards still apply).
@@ -322,9 +251,9 @@ pub fn order_cands(c: &mut [Cand], watcher_current: Option<Option<SessionId>>) {
     }
 }
 
-/// Is this dirty session ready for a batch? Background batches wait until it has been quiet for `QUIET_FOR`.
-pub fn session_ready(dirty: bool, quiet: Duration, force: bool) -> bool {
-    dirty && (force || quiet >= QUIET_FOR)
+/// Is a session with news ready for a batch? Background batches wait until it has been quiet for `QUIET_FOR`.
+pub fn session_ready(quiet: Duration, force: bool) -> bool {
+    force || quiet >= QUIET_FOR
 }
 
 // ---------------------------------------------------------------- daemon side
@@ -535,11 +464,9 @@ mod tests {
         assert!(batch_allowed(true, Some(s(1))));
         assert!(batch_allowed(true, None));
         // sessions
-        assert!(!session_ready(false, s(999), true));
-        assert!(!session_ready(true, s(19), false));
-        assert!(session_ready(true, s(20), false));
-        assert!(session_ready(true, s(0), true));
-        assert!(is_ssh("ssh -p 22 host") && is_ssh("/usr/bin/ssh h") && !is_ssh("sshfs a b") && !is_ssh("echo ssh"));
+        assert!(!session_ready(s(19), false));
+        assert!(session_ready(s(20), false));
+        assert!(session_ready(s(0), true));
     }
 
     #[test]
@@ -597,25 +524,6 @@ mod tests {
         assert_eq!(Out::from_line("4\t\t"), Some(Out { sid: 4, name: None, recap: None, summary: None }));
         // an old three-field line still parses
         assert_eq!(Out::from_line("5\tab-cd\tfixing the build now").unwrap().summary, None);
-    }
-
-    #[test]
-    fn guessed_digest() {
-        let t = "user@host:~/nt$ cargo build\n   Compiling nt\nerror[E0308]: mismatched types\nerror: could not compile `nt`\n\
-user@host:~/nt$ vim src/proto.rs\n$ cargo build\n% git status\n# comment line in output\n> quoted\nFAILED: permission denied\n";
-        let d = guess_digest("cwd: ~/nt", t, "", None);
-        assert_eq!(
-            d,
-            "cwd: ~/nt\ncommands (oldest first):\n  cargo build\n  vim src/proto.rs\n  cargo build\n  git status\n      | error[E0308]: mismatched types\n      | error: could not compile `nt`\n      | FAILED: permission denied\n"
-        );
-        assert!(guess_digest("cwd: /", "a\n\nb\n", "top", None).ends_with("      | a\n      | b\nforeground: top\n"));
-        // rolling: the previous summary first, "new commands since then"
-        assert_eq!(
-            guess_digest("cwd: /", "$ ls\n", "", Some("Did x. ")),
-            "earlier summary: Did x.\ncwd: /\nnew commands since then (oldest first):\n  ls\n"
-        );
-        assert_eq!(prompt_command("#hash"), None);
-        assert_eq!(prompt_command("root@h:/# ls -l"), Some("ls -l"));
     }
 
     #[test]

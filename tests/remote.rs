@@ -288,3 +288,51 @@ async fn tampered_ciphertext_drops_connection() {
     w.write_all(&frame(sealed)).await.unwrap();
     assert!(timeout(Duration::from_secs(10), r.read_msg::<S2C>()).await.unwrap().is_err(), "server should hang up");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn detach_others_evicts_a_remote_client_live_or_offline() {
+    let d = Daemon::start();
+    let (id, key) = d.register().await;
+
+    // Connected remote client: told right away.
+    let mut a = d.remote(&id, &key).await;
+    let sid = a.attach(None, None).await;
+    a.input(1, "echo one$((0+1))\n").await;
+    a.wait("one1", false).await;
+    let mut l = d.local().await;
+    l.attach(Some(sid), None).await;
+    l.send(&C2S::DetachOthers { session: sid }).await;
+    loop {
+        if matches!(a.recv().await, S2C::Evicted) {
+            break;
+        }
+    }
+    let off = a.off;
+    drop(a);
+    let mut b = d.remote(&id, &key).await;
+    b.send(&C2S::Attach { session: Some(sid), cols: 80, rows: 24, term: "xterm".into(), resume_from: Some(off), cwd: None }).await;
+    loop {
+        match b.recv().await {
+            S2C::Evicted => break,
+            S2C::Attached { .. } => panic!("an evicted client resumed by reconnecting"),
+            _ => {}
+        }
+    }
+    // Choosing the session again is allowed.
+    b.attach(Some(sid), None).await;
+    let off = b.off;
+    drop(b);
+
+    // Offline remote client (its connection is gone when M-D is pressed): refused when it reconnects.
+    l.send(&C2S::DetachOthers { session: sid }).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut c = d.remote(&id, &key).await;
+    c.send(&C2S::Attach { session: Some(sid), cols: 80, rows: 24, term: "xterm".into(), resume_from: Some(off), cwd: None }).await;
+    loop {
+        match c.recv().await {
+            S2C::Evicted => break,
+            S2C::Attached { .. } => panic!("an offline client resumed after DetachOthers"),
+            _ => {}
+        }
+    }
+}

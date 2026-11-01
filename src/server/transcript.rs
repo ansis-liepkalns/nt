@@ -36,8 +36,6 @@ struct Lines {
     alt_entered: bool,
     out: String,
     blank_run: u32,
-    /// Redraw operations (cursor up / home, screen erase, overwriting a line) since the last `take_noise`.
-    noise: u32,
     overwrote: bool,
 }
 
@@ -79,7 +77,6 @@ impl Perform for Lines {
         if self.cur < self.line.len() {
             if self.line[self.cur] != c && !self.overwrote {
                 self.overwrote = true;
-                self.noise += 1;
             }
             self.line[self.cur] = c;
         } else {
@@ -128,9 +125,6 @@ impl Perform for Lines {
         if self.alt || !inter.is_empty() {
             return;
         }
-        if matches!(c, 'A' | 'H' | 'f' | 'J') || (c == 'K' && p0 == 2) {
-            self.noise += 1;
-        }
         match c {
             'K' => match p0 {
                 0 => self.line.truncate(self.cur),
@@ -171,11 +165,6 @@ impl Stripper {
     /// True once after the alternate screen was entered.
     pub fn take_alt_entered(&mut self) -> bool {
         std::mem::take(&mut self.st.alt_entered)
-    }
-
-    /// Redraw operations seen since the last call (a measure of TUI noise).
-    pub fn take_noise(&mut self) -> u32 {
-        std::mem::take(&mut self.st.noise)
     }
 
     /// Lines and shell events since the last call.
@@ -234,10 +223,6 @@ impl Transcript {
 
     pub fn in_alt(&self) -> bool {
         self.stripper.in_alt()
-    }
-
-    pub fn take_noise(&mut self) -> u32 {
-        self.stripper.take_noise()
     }
 
     pub fn partial(&self) -> String {
@@ -313,6 +298,7 @@ impl Transcript {
     }
 
     /// Last `max` bytes of the transcript (starting at a line boundary), flushing first.
+    #[cfg(test)]
     pub fn tail(&mut self, max: usize) -> String {
         self.flush();
         let Some(path) = &self.path else { return String::new() };
@@ -522,16 +508,5 @@ mod tests {
         assert_eq!(titles(&[b"\x1b]0;one\x07x\x1b]2;two\x1b\\y"]), [t("one"), t("two")]);
         // split across reads, inside the sequence and in a UTF-8 glyph
         assert_eq!(titles(&[b"\x1b]0;\xe2\x9c", b"\xb3 Fix bug", b"\x07", b"\x1b]2;next\x1b", b"\\"]), [t("✳ Fix bug"), t("next")]);
-    }
-
-    #[test]
-    fn tui_redraws_count_as_noise() {
-        let mut s = Stripper::default();
-        for i in 0..30 {
-            s.feed(format!("\x1b[2K\x1b[1A\x1b[2K\r spinner {i}\r\n").as_bytes());
-        }
-        assert!(s.take_noise() >= 60);
-        s.feed(b"plain\r\nlines\r\n");
-        assert_eq!(s.take_noise(), 0);
     }
 }

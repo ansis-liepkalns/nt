@@ -2,8 +2,9 @@
 
 # Prefix key: C-<letter> or one of C-@ C-[ C-\ C-] C-^ C-_
 prefix = "C-]"
-# Lines of scrollback kept per session by the server.
-scrollback = 1000
+# Lines of scrollback kept per session by the server; replayed into your terminal's scrollback when you switch to the
+# session. Each line costs 32 bytes per column (5000 lines x 120 columns = ~19 MB when full).
+scrollback = 5000
 # TCP port for remote clients.
 port = 4022
 # Inject prompt/command hooks into bash, zsh and fish sessions (live status, command log).
