@@ -42,6 +42,8 @@ pub struct Config {
     pub shell_integration: bool,
     /// Show the one-time key tip when a client attaches.
     pub tips: bool,
+    /// Remote clients append the session output to `<dir>/ssh_session_<time>.txt`; empty = no log.
+    pub ssh_log_dir: String,
 }
 
 /// Granite 4.0 1B Instruct, Q4_K_M (~1 GB, ~1.5 GB RSS): the best name/topic quality in bench/RESULTS.md.
@@ -67,6 +69,7 @@ impl Default for Config {
             llm_threads: None,
             shell_integration: true,
             tips: true,
+            ssh_log_dir: String::new(),
         }
     }
 }
@@ -132,6 +135,10 @@ impl Config {
                 "prefix" => parse_prefix(&v).map(|p| self.prefix = p).is_some(),
                 "scrollback" => v.parse().map(|n| self.scrollback = n).is_ok(),
                 "port" => v.parse().map(|n| self.port = n).is_ok(),
+                "ssh_log_dir" => {
+                    self.ssh_log_dir = v;
+                    true
+                }
                 "shell_integration" => v.parse().map(|b| self.shell_integration = b).is_ok(),
                 "llm" => match v.as_str() {
                     "local" | "true" => Some(if cfg!(feature = "llm") { LlmMode::Local } else { LlmMode::Off }),
@@ -204,6 +211,9 @@ mod tests {
         assert_eq!(c.llm_threads, None);
         c.apply("llm_threads = 0");
         assert_eq!(c.llm_threads, None);
+        assert_eq!(c.ssh_log_dir, "");
+        c.apply("ssh_log_dir = \"~/ssh_log\"");
+        assert_eq!(c.ssh_log_dir, "~/ssh_log");
     }
 
     #[test]

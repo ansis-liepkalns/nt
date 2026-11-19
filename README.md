@@ -78,6 +78,7 @@ nt --help | --version
 On the server, nt is looked up on `PATH` plus `~/.local/bin` and `~/.cargo/bin` (set `NT_REMOTE_CMD=/path/to/nt` on the client for other locations), and TCP
 port **4022** must be reachable (config `port`). `nt` always starts a new session; to get back to an existing one use `nt -s`
 (the most recently used session is preselected) or, inside nt, `C-] C-]`. The ssh port is `-p`: `nt -p 2200 myserver`. Other ssh arguments go after `--`: `nt myserver -- -J jump`.
+With config `ssh_log_dir = "~/ssh_log"` a remote client appends the session output to `~/ssh_log/ssh_session_<time>.txt` (mode 0600), like `ssh ... | tee -a`.
 
 ## Key bindings
 Prefix is `C-]` (config `prefix`). Everything else goes straight to the shell.
