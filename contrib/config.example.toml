@@ -7,6 +7,8 @@ prefix = "C-]"
 scrollback = 5000
 # TCP port for remote clients.
 port = 4022
+# Remote clients append the session output to <dir>/ssh_session_<time>.txt, like `ssh ... | tee -a`; empty = no log.
+ssh_log_dir = ""
 # Inject prompt/command hooks into bash, zsh and fish sessions (live status, command log).
 shell_integration = true
 

@@ -9,6 +9,7 @@ mod usage;
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,6 +64,8 @@ struct Client {
     term: String,
     sessions: Vec<SessionInfo>,
     cur: Option<SessionId>,
+    /// A resume attach after a reconnect is waiting for the server's answer.
+    resuming: bool,
     last: Option<SessionId>,
     mirror: vt100::Parser,
     mode: Mode,
@@ -86,6 +89,8 @@ struct Client {
     history_clear: bool,
     /// Test hook: collect the terminal output here instead of writing to stdout.
     capture: Option<Vec<u8>>,
+    /// Remote session output appended as is, like `ssh | tee -a`.
+    ssh_log: Option<std::fs::File>,
     /// Show the one-time key tip (config `tips`).
     tips: bool,
     /// `C-] ?` help box is showing on top of the current mode.
@@ -270,6 +275,21 @@ pub fn ls(dest: Option<&str>, ssh_args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `<dir>/ssh_session_<date +%F_%H_%m_%S_%s>.txt`, the name the shell's logging `ssh` alias uses. `~/` means `$HOME`.
+fn open_ssh_log(dir: &str, remote: bool) -> Option<std::fs::File> {
+    if dir.is_empty() || !remote {
+        return None;
+    }
+    let dir = match (dir.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => std::path::PathBuf::from(home).join(rest),
+        _ => std::path::PathBuf::from(dir),
+    };
+    let out = std::process::Command::new("date").arg("+%F_%H_%m_%S_%s").output().ok()?;
+    let stamp = String::from_utf8(out.stdout).ok()?;
+    let path = dir.join(format!("ssh_session_{}.txt", stamp.trim()));
+    std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&path).map_err(|e| eprintln!("nt: ssh log {}: {e}", path.display())).ok()
+}
+
 async fn session(cfg: &Config, opts: Opts) -> Result<String> {
     let (target, creds) = prepare(opts.dest.as_deref(), &opts.ssh_args)?;
     let mut link = open_link(&target, creds.as_ref(), 0).await?;
@@ -303,6 +323,7 @@ async fn session(cfg: &Config, opts: Opts) -> Result<String> {
         cur: None,
         last: None,
         mode: Mode::Pass,
+        resuming: false,
         prefix_pending: false,
         status_shown: false,
         watching: false,
@@ -314,6 +335,7 @@ async fn session(cfg: &Config, opts: Opts) -> Result<String> {
         shown_any: false,
         history_clear: false,
         capture: None,
+        ssh_log: open_ssh_log(&cfg.ssh_log_dir, opts.dest.is_some()),
         tips: cfg.tips,
         help: false,
         tip_until: None,
@@ -513,6 +535,7 @@ impl Client {
                 resume_from: Some(self.out_off),
                 cwd: None,
             };
+            self.resuming = true;
             self.send(msg).await
         } else {
             self.send(C2S::List).await
@@ -742,6 +765,7 @@ impl Client {
                 }
             }
             S2C::Attached { session } => {
+                self.resuming = false;
                 if self.cur != Some(session) {
                     self.history_clear = self.shown_any;
                     self.shown_any = true;
@@ -757,6 +781,9 @@ impl Client {
                 self.out_off = offset + data.len() as u64;
                 let was_alt = self.mirror.screen().alternate_screen();
                 self.mirror.process(&data);
+                if let Some(f) = &mut self.ssh_log {
+                    let _ = f.write_all(&data);
+                }
                 if matches!(self.mode, Mode::Pass) {
                     self.emit(&data);
                     let now_alt = self.mirror.screen().alternate_screen();
@@ -790,6 +817,12 @@ impl Client {
                         self.open_switcher();
                     }
                 }
+            }
+            S2C::Error(e) if self.resuming && e == proto::NO_SUCH_SESSION => {
+                // The daemon restarted and no longer has the session: start a new one.
+                self.resuming = false;
+                self.cur = None;
+                self.attach(None).await?;
             }
             S2C::Error(e) => self.status(&e),
             S2C::Evicted => self.quit = Some("detached: another client took the session over".into()),
@@ -1056,6 +1089,7 @@ mod tests {
             last: None,
             mirror: vt100::Parser::new(10, 40, 0),
             mode: Mode::Pass,
+            resuming: false,
             prefix_pending: false,
             status_shown: false,
             watching: false,
@@ -1067,6 +1101,7 @@ mod tests {
             shown_any: false,
             history_clear: false,
             capture: Some(Vec::new()),
+            ssh_log: None,
             tips: false,
             help: false,
             tip_until: None,
@@ -1192,6 +1227,46 @@ mod tests {
         assert_eq!(h.c.new_session_cwd(), std::env::current_dir().unwrap().to_str().map(String::from));
         h.c.remote = Some("box".into());
         assert_eq!(h.c.new_session_cwd(), None);
+    }
+
+    #[test]
+    fn ssh_log_gets_remote_output_only() {
+        let dir = std::env::temp_dir().join(format!("nt-ssh-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        assert!(open_ssh_log("", true).is_none() && open_ssh_log(d, false).is_none());
+        let mut h = Harness::new();
+        h.c.ssh_log = open_ssh_log(d, true);
+        h.attach(1, b"$ ");
+        h.out(b"hello\r\n");
+        h.c.open_switcher();
+        h.out(b"while switching\r\n");
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        let name = files[0].file_name().unwrap().to_str().unwrap().to_string();
+        let text = std::fs::read_to_string(&files[0]).unwrap();
+        let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&files[0]).unwrap().permissions());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(files.len() == 1 && name.starts_with("ssh_session_") && name.ends_with(".txt"), "{files:?}");
+        assert_eq!(text, "hello\r\nwhile switching\r\n");
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn missing_session_after_reconnect_starts_a_new_one() {
+        let mut h = Harness::new();
+        h.attach(7, b"$ ");
+        h.c.resuming = true;
+        h.server(S2C::Error(proto::NO_SUCH_SESSION.into()));
+        assert_eq!((h.c.cur, h.c.resuming), (None, false));
+    }
+
+    #[test]
+    fn other_errors_keep_the_session() {
+        let mut h = Harness::new();
+        h.attach(7, b"$ ");
+        h.c.resuming = true;
+        h.server(S2C::Error("cannot start session".into()));
+        assert_eq!(h.c.cur, Some(7));
     }
 
     #[test]

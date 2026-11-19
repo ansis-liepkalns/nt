@@ -12,6 +12,7 @@
 network loss, laptop sleep and roaming; the client reconnects on its own and picks up where it left off.
 
 - **Reconnects by itself**: close the lid, change networks, come back; your shell and its output are still there.
+  If the server host rebooted and its daemon is gone, the client runs the ssh bootstrap again after three failed connects and starts a new session.
 - **Session switcher**: list, switch, rename, close and full-text search sessions from inside nt, each with a live status
   (`✓ cargo build · 2m ago`), CPU/RAM bars, a short topic and a searchable summary of what was done.
 - **Multiple clients** can attach to one session.
@@ -76,7 +77,8 @@ nt --help | --version
 ```
 On the server, nt is looked up on `PATH` plus `~/.local/bin` and `~/.cargo/bin` (set `NT_REMOTE_CMD=/path/to/nt` on the client for other locations), and TCP
 port **4022** must be reachable (config `port`). `nt` always starts a new session; to get back to an existing one use `nt -s`
-(the most recently used session is preselected) or, inside nt, `C-] C-]`. Extra ssh arguments go after `--`: `nt myserver -- -p 2200 -J jump`.
+(the most recently used session is preselected) or, inside nt, `C-] C-]`. The ssh port is `-p`: `nt -p 2200 myserver`. Other ssh arguments go after `--`: `nt myserver -- -J jump`.
+With config `ssh_log_dir = "~/ssh_log"` a remote client appends the session output to `~/ssh_log/ssh_session_<time>.txt` (mode 0600), like `ssh ... | tee -a`.
 
 ## Key bindings
 Prefix is `C-]` (config `prefix`). Everything else goes straight to the shell.
