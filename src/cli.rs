@@ -11,7 +11,8 @@ nt — reconnectable terminal sessions
   nt restart [<host>]  restart the nt server after upgrading (ends sessions)
 
 Inside nt:  C-] C-] sessions · C-] d detach · C-] ? keys
-Config:     ~/.config/nt/config.toml   ssh options: nt <host> -- -p 2200
+Config:     ~/.config/nt/config.toml   ssh port: nt -p 2200 <host>
+            other ssh options: nt <host> -- -J jump
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,13 +33,14 @@ pub enum Cmd {
 pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Cmd, String> {
     let mut args: Vec<&str> = args.iter().map(|a| a.as_ref()).collect();
     // Everything after `--` belongs to ssh.
-    let ssh: Vec<String> = match args.iter().position(|a| *a == "--") {
+    let mut ssh: Vec<String> = match args.iter().position(|a| *a == "--") {
         Some(i) => args.split_off(i).into_iter().skip(1).map(String::from).collect(),
         None => Vec::new(),
     };
     let mut p = lexopt::Parser::from_args(args);
     let (mut sessions, mut help, mut version, mut foreground, mut restart, mut no_shell) = (false, false, false, false, false, false);
-    let (mut port, mut model, mut cwd): (Option<u16>, Option<String>, Option<String>) = (None, None, None);
+    let (mut port, mut ssh_port): (Option<u16>, Option<u16>) = (None, None);
+    let (mut model, mut cwd): (Option<String>, Option<String>) = (None, None);
     let mut pos: Vec<String> = Vec::new();
     let e = |e: lexopt::Error| e.to_string();
     while let Some(arg) = p.next().map_err(e)? {
@@ -49,6 +51,7 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Cmd, String> {
             Long("foreground") => foreground = true,
             Long("restart") => restart = true,
             Long("no-shell-integration") => no_shell = true,
+            Short('p') => ssh_port = Some(p.value().map_err(e)?.parse().map_err(e)?),
             Long("port") => port = Some(p.value().map_err(e)?.parse().map_err(e)?),
             Long("model") => model = Some(p.value().map_err(e)?.string().map_err(e)?),
             Long("cwd") => cwd = Some(p.value().map_err(e)?.string().map_err(e)?),
@@ -71,8 +74,12 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Cmd, String> {
         Some(_) => !sessions && plain,
         None => plain,
     };
-    if !ok {
+    let uses_ssh = matches!(sub, None | Some("ls") | Some("restart"));
+    if !ok || (ssh_port.is_some() && !uses_ssh) {
         return Err("unexpected option for this command".into());
+    }
+    if let Some(n) = ssh_port {
+        ssh.splice(0..0, ["-p".to_string(), n.to_string()]);
     }
     if help {
         return Ok(Cmd::Help);
@@ -84,6 +91,7 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Cmd, String> {
         let h = it.next();
         match it.next() {
             Some(x) => Err(format!("unexpected argument '{x}'")),
+            None if h.is_none() && ssh_port.is_some() => Err("-p needs a host".into()),
             None => Ok(h),
         }
     };
@@ -107,6 +115,9 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Cmd, String> {
             if let Some(x) = it.next() {
                 return Err(format!("unexpected argument '{x}'"));
             }
+            if dest.is_none() && ssh_port.is_some() {
+                return Err("-p needs a host".into());
+            }
             Ok(Cmd::Session { dest, ssh, switcher: sessions })
         }
     }
@@ -127,6 +138,10 @@ mod tests {
             (&[], session(None, &[], false)),
             (&["box"], session(Some("box"), &[], false)),
             (&["me@box", "--", "-p", "2200"], session(Some("me@box"), &["-p", "2200"], false)),
+            (&["-p", "9999", "me@box"], session(Some("me@box"), &["-p", "9999"], false)),
+            (&["-p", "1", "box", "--", "-J", "j"], session(Some("box"), &["-p", "1", "-J", "j"], false)),
+            (&["ls", "-p", "9999", "box"], Ok(Cmd::Ls { dest: Some("box".into()), ssh: ssh(&["-p", "9999"]) })),
+            (&["restart", "-p", "9999", "box"], Ok(Cmd::Restart { dest: Some("box".into()), ssh: ssh(&["-p", "9999"]) })),
             (&["-s"], session(None, &[], true)),
             (&["--sessions", "box"], session(Some("box"), &[], true)),
             (&["box", "-s", "--", "-J", "j"], session(Some("box"), &["-J", "j"], true)),
@@ -167,6 +182,15 @@ mod tests {
         for (args, want) in cases {
             assert_eq!(parse(args), want, "args {args:?}");
         }
+        assert!(parse(&["-p"]).is_err());
+        assert!(parse(&["-p", "x", "box"]).is_err());
+        assert!(parse(&["-p", "70000", "box"]).is_err());
+        assert!(parse(&["bootstrap", "-p", "1"]).is_err());
+        assert!(parse(&["server", "-p", "1"]).is_err());
+        assert!(parse(&["-p", "1"]).is_err());
+        assert!(parse(&["-s", "-p", "1"]).is_err());
+        assert!(parse(&["ls", "-p", "1"]).is_err());
+        assert!(parse(&["restart", "-p", "1"]).is_err());
         assert!(parse(&["--port"]).is_err());
         assert!(parse(&["server", "--port", "x"]).is_err());
     }
