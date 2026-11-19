@@ -1169,7 +1169,7 @@ fn attach(
     let mut s = st.borrow_mut();
     let sid = match session {
         Some(id) if s.sessions.contains_key(&id) => id,
-        Some(_) => return s.send(cid, S2C::Error("no such session".into())),
+        Some(_) => return s.send(cid, S2C::Error(proto::NO_SUCH_SESSION.into())),
         None => match s.create_session(cols, rows, term, cwd) {
             Ok(id) => {
                 spawn_local(pty_task(st.clone(), id, s.sessions[&id].master.clone()));
@@ -1256,7 +1256,7 @@ fn rename(st: &Shared, cid: u64, sid: SessionId, name: &str) {
     let name = name.trim();
     let taken: Vec<String> = s.sessions.values().map(|x| x.name.clone()).collect();
     let Some(sess) = s.sessions.get_mut(&sid) else {
-        return s.send(cid, S2C::Error("no such session".into()));
+        return s.send(cid, S2C::Error(proto::NO_SUCH_SESSION.into()));
     };
     if name.is_empty() {
         let taken: Vec<&str> = taken.iter().map(String::as_str).collect();
@@ -1277,7 +1277,7 @@ fn kill(st: &Shared, cid: u64, sid: SessionId) {
     {
         let mut s = st.borrow_mut();
         let Some(sess) = s.sessions.get_mut(&sid) else {
-            return s.send(cid, S2C::Error("no such session".into()));
+            return s.send(cid, S2C::Error(proto::NO_SUCH_SESSION.into()));
         };
         if sess.exited {
             return s.end_session(sid);
@@ -1300,7 +1300,7 @@ fn kill(st: &Shared, cid: u64, sid: SessionId) {
 fn respawn(st: &Shared, cid: u64, sid: SessionId) {
     let mut s = st.borrow_mut();
     let Some(sess) = s.sessions.get_mut(&sid) else {
-        return s.send(cid, S2C::Error("no such session".into()));
+        return s.send(cid, S2C::Error(proto::NO_SUCH_SESSION.into()));
     };
     if !sess.exited {
         return;

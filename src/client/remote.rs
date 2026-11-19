@@ -137,6 +137,20 @@ fn is_eof(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Marker: the host refused the TCP connection, so nothing listens on the port, e.g. after the host rebooted.
+/// Timeouts and unreachable networks are not counted: ssh would fail there too.
+#[derive(Debug)]
+struct ConnectFailed;
+
+impl std::fmt::Display for ConnectFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the server is not running")
+    }
+}
+
+/// Consecutive connect failures after which the daemon is assumed gone and ssh starts it again.
+const CONNECT_FAILURES_BEFORE_REBOOTSTRAP: u32 = 3;
+
 /// Marker: the connection died after our Hello but before Welcome (e.g. a wrong key).
 #[derive(Debug)]
 struct HelloDropped;
@@ -182,7 +196,15 @@ pub async fn open_link(target: &Target, creds: Option<&Creds>, acked: u64) -> Re
             let s = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect((host.as_str(), c.port)))
                 .await
                 .map_err(|_| anyhow!("connect to {host}:{} timed out", c.port))?
-                .with_context(|| format!("connecting to {host}:{}", c.port))?;
+                .map_err(|e| {
+                    let refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
+                    let e = anyhow::Error::new(e).context(format!("connecting to {host}:{}", c.port));
+                    if refused {
+                        e.context(ConnectFailed)
+                    } else {
+                        e
+                    }
+                })?;
             let _ = s.set_nodelay(true);
             let (r, w) = s.into_split();
             tokio::time::timeout(Duration::from_secs(10), proto::client_handshake(Box::new(r), Box::new(w), &c.id, &c.key))
@@ -232,6 +254,7 @@ pub struct Connector {
     next_try: Instant,
     delay: Duration,
     hello_drops: u32,
+    connect_failures: u32,
     /// Set while the terminal is raw; ssh prompts then need cooked mode and stdin to ourselves.
     pub raw: bool,
     pub stdin_paused: Arc<AtomicBool>,
@@ -246,6 +269,7 @@ impl Connector {
             next_try: Instant::now(),
             delay: Duration::from_millis(500),
             hello_drops: 0,
+            connect_failures: 0,
             raw: false,
             stdin_paused,
             acked: 0,
@@ -259,6 +283,7 @@ impl Connector {
             Ok(l) => {
                 self.delay = Duration::from_millis(500);
                 self.hello_drops = 0;
+                self.connect_failures = 0;
                 Ok(l)
             }
             Err(e) => {
@@ -282,20 +307,27 @@ impl Connector {
                     return Err(e);
                 }
             }
+            // The host is up but the daemon is gone (reboot, crash). Only ssh can start it again.
+            Err(e) if e.is::<ConnectFailed>() => {
+                self.connect_failures += 1;
+                if self.connect_failures < CONNECT_FAILURES_BEFORE_REBOOTSTRAP {
+                    return Err(e);
+                }
+            }
             r => return r,
         }
         self.hello_drops = 0;
+        self.connect_failures = 0;
         self.rebootstrap()?;
         open_link(&self.target, self.creds.as_ref(), self.acked).await
     }
 
     fn rebootstrap(&mut self) -> Result<()> {
         let Target::Remote { dest, ssh_args, .. } = &self.target else { bail!("not a remote target") };
-        self.creds = None;
         if self.raw {
             self.stdin_paused.store(true, Ordering::SeqCst);
             let _ = disable_raw_mode();
-            eprint!("\r\nnt: registration lost, re-running ssh bootstrap\r\n");
+            eprint!("\r\nnt: re-running ssh bootstrap\r\n");
         }
         let r = ssh_bootstrap(dest, ssh_args);
         if self.raw {
@@ -304,5 +336,19 @@ impl Connector {
         }
         self.creds = Some(r?);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_port_is_a_connect_failure() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let target = Target::Remote { dest: "box".into(), ssh_args: Vec::new(), host: "127.0.0.1".into() };
+        let creds = Creds { port, id: [0; 16], key: [0; 32] };
+        let err = open_link(&target, Some(&creds), 0).await.err().unwrap();
+        assert!(err.is::<ConnectFailed>(), "{err:#}");
     }
 }

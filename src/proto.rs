@@ -7,6 +7,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PROTO_VERSION: u32 = 8;
+/// `S2C::Error` text for a session id the server does not know.
+pub const NO_SUCH_SESSION: &str = "no such session";
 pub const MAX_FRAME: usize = 1 << 20;
 
 pub type SessionId = u32;

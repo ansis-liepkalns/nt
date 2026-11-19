@@ -12,6 +12,7 @@
 network loss, laptop sleep and roaming; the client reconnects on its own and picks up where it left off.
 
 - **Reconnects by itself**: close the lid, change networks, come back; your shell and its output are still there.
+  If the server host rebooted and its daemon is gone, the client runs the ssh bootstrap again after three failed connects and starts a new session.
 - **Session switcher**: list, switch, rename, close and full-text search sessions from inside nt, each with a live status
   (`✓ cargo build · 2m ago`), CPU/RAM bars, a short topic and a searchable summary of what was done.
 - **Multiple clients** can attach to one session.

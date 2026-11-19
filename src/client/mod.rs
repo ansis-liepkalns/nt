@@ -63,6 +63,8 @@ struct Client {
     term: String,
     sessions: Vec<SessionInfo>,
     cur: Option<SessionId>,
+    /// A resume attach after a reconnect is waiting for the server's answer.
+    resuming: bool,
     last: Option<SessionId>,
     mirror: vt100::Parser,
     mode: Mode,
@@ -303,6 +305,7 @@ async fn session(cfg: &Config, opts: Opts) -> Result<String> {
         cur: None,
         last: None,
         mode: Mode::Pass,
+        resuming: false,
         prefix_pending: false,
         status_shown: false,
         watching: false,
@@ -513,6 +516,7 @@ impl Client {
                 resume_from: Some(self.out_off),
                 cwd: None,
             };
+            self.resuming = true;
             self.send(msg).await
         } else {
             self.send(C2S::List).await
@@ -742,6 +746,7 @@ impl Client {
                 }
             }
             S2C::Attached { session } => {
+                self.resuming = false;
                 if self.cur != Some(session) {
                     self.history_clear = self.shown_any;
                     self.shown_any = true;
@@ -790,6 +795,12 @@ impl Client {
                         self.open_switcher();
                     }
                 }
+            }
+            S2C::Error(e) if self.resuming && e == proto::NO_SUCH_SESSION => {
+                // The daemon restarted and no longer has the session: start a new one.
+                self.resuming = false;
+                self.cur = None;
+                self.attach(None).await?;
             }
             S2C::Error(e) => self.status(&e),
             S2C::Evicted => self.quit = Some("detached: another client took the session over".into()),
@@ -1056,6 +1067,7 @@ mod tests {
             last: None,
             mirror: vt100::Parser::new(10, 40, 0),
             mode: Mode::Pass,
+            resuming: false,
             prefix_pending: false,
             status_shown: false,
             watching: false,
@@ -1192,6 +1204,24 @@ mod tests {
         assert_eq!(h.c.new_session_cwd(), std::env::current_dir().unwrap().to_str().map(String::from));
         h.c.remote = Some("box".into());
         assert_eq!(h.c.new_session_cwd(), None);
+    }
+
+    #[test]
+    fn missing_session_after_reconnect_starts_a_new_one() {
+        let mut h = Harness::new();
+        h.attach(7, b"$ ");
+        h.c.resuming = true;
+        h.server(S2C::Error(proto::NO_SUCH_SESSION.into()));
+        assert_eq!((h.c.cur, h.c.resuming), (None, false));
+    }
+
+    #[test]
+    fn other_errors_keep_the_session() {
+        let mut h = Harness::new();
+        h.attach(7, b"$ ");
+        h.c.resuming = true;
+        h.server(S2C::Error("cannot start session".into()));
+        assert_eq!(h.c.cur, Some(7));
     }
 
     #[test]
